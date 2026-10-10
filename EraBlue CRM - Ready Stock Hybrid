@@ -1,0 +1,2817 @@
+// ==UserScript==
+// @name         EraBlue CRM - Ready Stock Hybrid New
+// @namespace    https://crm.erablue.id/
+// @version      4.0.4
+// @description  Ready Stock Hybrid - SKU/Toko View - Auto Refresh - Click Anywhere
+// @match        https://crm.erablue.id/kiem-tra-ton-kho*
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const CONFIG = {
+        tableSelector: '#tbInventory',
+        panelId: 'ebReadyStockPanel',
+        minStock: 1,
+        skuMaxHeight: 320,
+        storeMaxHeight: 320,
+        scanDelay: 150
+    };
+
+    let inventoryData = [];
+    let currentView = 'sku';
+    let currentSearch = '';
+
+    let tableObserver = null;
+    let bodyObserver = null;
+    let scanTimer = null;
+    let tableWatchTimer = null;
+    let currentTable = null;
+    let lastSignature = '';
+
+    // =========================================================
+    // CSS
+    // =========================================================
+
+    const css = `
+        #tbInventory tr.eb-ready-row {
+            background: rgba(34,197,94,.08) !important;
+            box-shadow: inset 4px 0 0 #16a34a !important;
+        }
+
+        #tbInventory tr.eb-ready-row:hover {
+            background: rgba(34,197,94,.15) !important;
+        }
+
+        #${CONFIG.panelId} {
+            position: fixed !important;
+            left: 18px !important;
+            right: 18px !important;
+            bottom: 16px !important;
+
+            z-index: 2147483647 !important;
+            isolation: isolate !important;
+
+            background: rgba(15,23,42,.97) !important;
+            color: #fff !important;
+
+            border: 1px solid rgba(255,255,255,.12) !important;
+            border-radius: 16px !important;
+
+            box-shadow:
+                0 12px 40px rgba(0,0,0,.35),
+                0 2px 8px rgba(0,0,0,.2) !important;
+
+            backdrop-filter: blur(12px) !important;
+            -webkit-backdrop-filter: blur(12px) !important;
+
+            font-family:
+                -apple-system,
+                BlinkMacSystemFont,
+                "Segoe UI",
+                Arial,
+                sans-serif !important;
+
+            overflow: visible !important;
+        }
+
+        #${CONFIG.panelId} * {
+            box-sizing: border-box !important;
+        }
+
+        .eb-ready-header {
+            display: grid;
+            grid-template-columns: max-content max-content minmax(180px, 1fr) 36px 36px;
+            align-items: center;
+            gap: 10px;
+            padding: 10px 15px;
+            min-height: 58px;
+            border-bottom: 1px solid rgba(255,255,255,.08);
+        }
+
+        .eb-ready-title {
+            display: flex;
+            align-items: center;
+            gap: 9px;
+            font-size: 14px;
+            font-weight: 800;
+            white-space: nowrap;
+        }
+
+        .eb-ready-dot {
+            width: 9px;
+            height: 9px;
+            flex-shrink: 0;
+            border-radius: 50%;
+            background: #22c55e;
+            box-shadow: 0 0 10px rgba(34,197,94,.8);
+        }
+
+        .eb-ready-count {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 25px;
+            height: 22px;
+            padding: 0 7px;
+            border-radius: 999px;
+            background: #16a34a;
+            color: #fff;
+            font-size: 11px;
+            font-weight: 800;
+        }
+
+        .eb-ready-search {
+            display: block;
+            width: 100%;
+            min-width: 0;
+            height: 36px;
+            margin: 0;
+            padding: 0 11px;
+            border: 1px solid rgba(255,255,255,.12);
+            border-radius: 8px;
+            outline: none;
+            background: rgba(255,255,255,.07);
+            color: #fff;
+            font-size: 12px;
+        }
+
+        .eb-ready-search::placeholder {
+            color: rgba(255,255,255,.45);
+        }
+
+        .eb-ready-search:focus {
+            border-color: rgba(34,197,94,.6);
+            background: rgba(255,255,255,.10);
+        }
+
+        .eb-ready-btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            border: 0;
+            outline: none;
+            cursor: pointer;
+            width: 36px;
+            min-width: 36px;
+            height: 36px;
+            margin: 0;
+            padding: 0 10px;
+            border-radius: 8px;
+            background: rgba(255,255,255,.08);
+            color: #fff;
+            font-size: 11px;
+            font-weight: 800;
+        }
+
+        .eb-ready-btn:hover {
+            background: rgba(255,255,255,.16);
+        }
+
+        .eb-ready-view-switch {
+            display: flex;
+            align-items: center;
+            justify-self: start;
+            height: 36px;
+            gap: 3px;
+            padding: 3px;
+            flex-shrink: 0;
+            background: rgba(255,255,255,.06);
+            border: 1px solid rgba(255,255,255,.08);
+            border-radius: 9px;
+        }
+
+        .eb-ready-view-btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            height: 28px;
+            margin: 0;
+            line-height: 1;
+            padding: 0 9px;
+            border: 0;
+            border-radius: 6px;
+            background: transparent;
+            color: rgba(255,255,255,.45);
+            cursor: pointer;
+            font-size: 9px;
+            font-weight: 800;
+        }
+
+        .eb-ready-view-btn.active {
+            background: rgba(255,255,255,.14);
+            color: #fff;
+        }
+
+        .eb-ready-list {
+            padding: 10px;
+            scroll-behavior: smooth;
+        }
+
+        .eb-ready-list::-webkit-scrollbar {
+            width: 7px;
+            height: 7px;
+        }
+
+        .eb-ready-list::-webkit-scrollbar-thumb {
+            background: rgba(255,255,255,.20);
+            border-radius: 999px;
+        }
+
+        #${CONFIG.panelId}.eb-view-sku .eb-ready-list {
+            display: grid;
+            grid-template-columns: repeat(auto-fill,minmax(250px,1fr));
+            gap: 8px;
+            max-height: ${CONFIG.skuMaxHeight}px;
+            overflow-x: hidden;
+            overflow-y: auto;
+            align-content: start;
+        }
+
+        .eb-ready-card {
+            min-width: 0;
+            padding: 11px;
+            border-radius: 11px;
+            background: rgba(255,255,255,.065);
+            border: 1px solid rgba(255,255,255,.08);
+            cursor: pointer;
+        }
+
+        .eb-ready-card:hover {
+            background: rgba(255,255,255,.10);
+        }
+
+        .eb-ready-product {
+            font-size: 12px;
+            font-weight: 750;
+            line-height: 1.35;
+            color: #fff;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }
+
+        .eb-ready-sku {
+            margin-top: 4px;
+            font-size: 10px;
+            color: rgba(255,255,255,.45);
+            font-family: monospace;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .eb-ready-info {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            margin-top: 8px;
+        }
+
+        .eb-ready-stock {
+            color: #4ade80;
+            font-size: 15px;
+            font-weight: 900;
+        }
+
+        .eb-ready-stock small {
+            font-size: 10px;
+            font-weight: 600;
+            color: rgba(255,255,255,.55);
+        }
+
+        .eb-ready-store-count {
+            padding: 4px 7px;
+            border-radius: 6px;
+            background: rgba(34,197,94,.12);
+            color: #4ade80;
+            font-size: 9px;
+            font-weight: 800;
+        }
+
+        .eb-ready-store-list {
+            margin-top: 9px;
+            padding-top: 8px;
+            border-top: 1px solid rgba(255,255,255,.07);
+        }
+
+        .eb-ready-store-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            padding: 5px 6px;
+            border-radius: 6px;
+            color: rgba(255,255,255,.68);
+            font-size: 9px;
+            cursor: pointer;
+        }
+
+        .eb-ready-store-row:hover {
+            background: rgba(255,255,255,.07);
+        }
+
+        .eb-ready-store-name {
+            min-width: 0;
+            overflow: hidden;
+            white-space: nowrap;
+            text-overflow: ellipsis;
+            cursor: pointer;
+        }
+
+        .eb-ready-store-qty {
+            flex-shrink: 0;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 25px;
+            padding: 3px 7px;
+            border-radius: 5px;
+            background: rgba(34,197,94,.10);
+            color: #4ade80;
+            font-weight: 900;
+            cursor: pointer;
+        }
+
+        .eb-ready-store-qty:hover {
+            background: rgba(34,197,94,.25);
+        }
+
+        #${CONFIG.panelId}.eb-view-store .eb-ready-list {
+            display: flex;
+            gap: 8px;
+            max-height: ${CONFIG.storeMaxHeight}px;
+            overflow-x: auto;
+            overflow-y: auto;
+            align-items: flex-start;
+        }
+
+        .eb-store-group {
+            min-width: 0;
+            flex: 0 0 270px;
+            padding: 11px;
+            border-radius: 11px;
+            background: rgba(255,255,255,.065);
+            border: 1px solid rgba(255,255,255,.08);
+        }
+
+        .eb-store-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid rgba(255,255,255,.07);
+        }
+
+        .eb-store-name {
+            min-width: 0;
+            overflow: hidden;
+            color: #fff;
+            font-size: 11px;
+            font-weight: 800;
+            white-space: nowrap;
+            text-overflow: ellipsis;
+            cursor: pointer;
+        }
+
+        .eb-store-name:hover {
+            color: #4ade80;
+        }
+
+        .eb-store-products {
+            margin-top: 7px;
+            max-height: 250px;
+            overflow-y: auto;
+            overflow-x: hidden;
+        }
+
+        .eb-store-product {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            padding: 6px 0;
+            border-bottom: 1px solid rgba(255,255,255,.045);
+            cursor: pointer;
+        }
+
+        .eb-store-product:hover {
+            background: rgba(255,255,255,.04);
+        }
+
+        .eb-store-product-info {
+            min-width: 0;
+            flex: 1;
+            cursor: pointer;
+        }
+
+        .eb-store-product-name {
+            overflow: hidden;
+            color: rgba(255,255,255,.75);
+            font-size: 9px;
+            white-space: nowrap;
+            text-overflow: ellipsis;
+        }
+
+        .eb-store-product-sku {
+            margin-top: 2px;
+            color: rgba(255,255,255,.35);
+            font-family: monospace;
+            font-size: 8px;
+        }
+
+        .eb-store-product-qty {
+            flex-shrink: 0;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 28px;
+            padding: 4px 7px;
+            border-radius: 5px;
+            background: rgba(34,197,94,.10);
+            color: #4ade80;
+            font-size: 10px;
+            font-weight: 900;
+            cursor: pointer;
+        }
+
+        .eb-ready-empty {
+            width: 100%;
+            padding: 25px 10px;
+            text-align: center;
+            color: rgba(255,255,255,.45);
+            font-size: 12px;
+        }
+
+        #${CONFIG.panelId}.eb-collapsed .eb-ready-list {
+            display: none !important;
+        }
+
+        @media(max-width:900px) {
+            .eb-ready-header {
+                grid-template-columns: max-content max-content minmax(0, 1fr) 36px 36px;
+                gap: 8px;
+            }
+
+            .eb-ready-search {
+                width: 100%;
+            }
+
+            #${CONFIG.panelId}.eb-view-sku .eb-ready-list {
+                grid-template-columns: 1fr;
+                max-height: 260px;
+            }
+
+            #${CONFIG.panelId}.eb-view-store .eb-ready-list {
+                max-height: 220px;
+            }
+        }
+
+        @media(max-width:700px) {
+            #${CONFIG.panelId} {
+                left: 8px !important;
+                right: 8px !important;
+                bottom: 8px !important;
+            }
+
+            .eb-ready-header {
+                grid-template-columns: minmax(0, 1fr) max-content max-content;
+                gap: 8px;
+            }
+
+            .eb-ready-title { grid-column: 1; }
+            .eb-ready-view-switch { grid-column: 2 / 4; grid-row: 1; justify-self: end; }
+            .eb-ready-search { grid-column: 1 / 3; grid-row: 2; }
+            #ebReadyRefresh { grid-column: 3; grid-row: 2; }
+            #ebReadyCollapse { grid-column: 3; grid-row: 1; justify-self: end; }
+
+            .eb-store-group {
+                flex-basis: 245px;
+            }
+        }
+        /* =====================================================
+           DIRECT CRM REQUEST UI
+           ===================================================== */
+        #ebReadyStockPanel .eb-api-bar {
+            padding: 10px 12px;
+            display: grid;
+            grid-template-columns: minmax(100px, .55fr) minmax(170px, 1fr) minmax(200px, 1.25fr) minmax(200px, 1.25fr) minmax(180px, 1fr) 76px;
+            gap: 8px;
+            align-items: center;
+            border-bottom: 1px solid rgba(255,255,255,.08);
+            background: rgba(0,0,0,.10);
+        }
+
+        /* Samakan tinggi setiap kolom agar tidak terpengaruh CSS bawaan CRM. */
+        #ebReadyStockPanel .eb-api-field {
+            position: relative;
+            min-width: 0;
+            width: 100%;
+            height: 36px;
+            min-height: 36px;
+            margin: 0 !important;
+            padding: 0 !important;
+            align-self: center;
+            display: flex;
+            align-items: stretch;
+        }
+
+        #ebReadyStockPanel .eb-api-btn,
+        #ebReadyStockPanel .eb-api-trigger,
+        #ebReadyStockPanel .eb-api-input {
+            display: block !important;
+            box-sizing: border-box !important;
+            position: relative !important;
+            top: 0 !important;
+            margin: 0 !important;
+            align-self: stretch;
+            flex: 1 1 auto;
+            width: 100%;
+            min-width: 0;
+            height: 36px !important;
+            min-height: 36px !important;
+            max-height: 36px !important;
+            padding-top: 0;
+            padding-bottom: 0;
+            border: 1px solid rgba(255,255,255,.13);
+            border-radius: 8px;
+            background: rgba(255,255,255,.07);
+            color: #fff;
+            outline: none;
+            font-size: 11px;
+            font-weight: 700;
+            line-height: normal;
+            vertical-align: middle;
+        }
+
+        #ebReadyStockPanel select.eb-api-input {
+            appearance: auto;
+            -webkit-appearance: auto;
+            padding-left: 10px;
+            padding-right: 8px;
+        }
+
+        #ebReadyStockPanel .eb-api-trigger {
+            cursor: pointer;
+            text-align: left;
+            padding: 0 28px 0 10px;
+            position: relative;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        #ebReadyStockPanel .eb-api-trigger::after {
+            content: "▾";
+            position: absolute;
+            right: 9px;
+            top: 10px;
+            color: rgba(255,255,255,.55);
+        }
+
+        #ebReadyStockPanel .eb-api-input {
+            padding: 0 10px;
+        }
+
+        #ebReadyStockPanel .eb-api-input::placeholder {
+            color: rgba(255,255,255,.42);
+        }
+
+        #ebReadyStockPanel .eb-api-input:focus,
+        #ebReadyStockPanel .eb-api-trigger:focus {
+            border-color: rgba(34,197,94,.65);
+            background: rgba(255,255,255,.10);
+        }
+
+        #ebReadyStockPanel .eb-api-btn {
+            cursor: pointer;
+            background: #16a34a;
+            border-color: #16a34a;
+            color: #fff;
+        }
+
+        #ebReadyStockPanel .eb-api-btn:hover {
+            background: #15803d;
+        }
+
+        #ebReadyStockPanel .eb-api-btn.eb-loading {
+            opacity: .65;
+            pointer-events: none;
+        }
+
+        #ebReadyStockPanel .eb-api-menu {
+            display: none;
+            position: absolute;
+            left: 0;
+            bottom: calc(100% + 6px);
+            width: 100%;
+            min-width: 220px;
+            max-height: 310px;
+            overflow: hidden;
+            z-index: 2147483647;
+            background: #111827;
+            border: 1px solid rgba(255,255,255,.16);
+            border-radius: 10px;
+            box-shadow: 0 15px 40px rgba(0,0,0,.55);
+        }
+
+        #ebReadyStockPanel .eb-api-field.open .eb-api-menu {
+            display: block;
+        }
+
+        #ebReadyStockPanel .eb-api-menu-tools {
+            display: flex;
+            gap: 6px;
+            padding: 7px;
+            border-bottom: 1px solid rgba(255,255,255,.08);
+        }
+
+        #ebReadyStockPanel .eb-api-menu-search {
+            flex: 1;
+            min-width: 0;
+            height: 29px;
+            padding: 0 8px;
+            border: 1px solid rgba(255,255,255,.12);
+            border-radius: 7px;
+            background: rgba(255,255,255,.06);
+            color: #fff;
+            outline: none;
+            font-size: 10px;
+        }
+
+        #ebReadyStockPanel .eb-api-menu-action {
+            height: 29px;
+            padding: 0 8px;
+            border: 0;
+            border-radius: 7px;
+            background: rgba(255,255,255,.08);
+            color: #fff;
+            cursor: pointer;
+            font-size: 9px;
+            font-weight: 800;
+        }
+
+        #ebReadyStockPanel .eb-api-options {
+            max-height: 255px;
+            overflow-y: auto;
+            padding: 5px;
+        }
+
+        #ebReadyStockPanel .eb-api-option {
+            display: flex;
+            align-items: center;
+            gap: 7px;
+            min-height: 29px;
+            padding: 4px 6px;
+            border-radius: 6px;
+            color: rgba(255,255,255,.78);
+            font-size: 10px;
+            cursor: pointer;
+        }
+
+        #ebReadyStockPanel .eb-api-option:hover {
+            background: rgba(255,255,255,.07);
+        }
+
+        #ebReadyStockPanel .eb-api-option input {
+            margin: 0;
+            accent-color: #22c55e;
+        }
+
+        #ebReadyStockPanel .eb-api-status {
+            padding: 5px 12px;
+            min-height: 24px;
+            color: rgba(255,255,255,.45);
+            font-size: 9px;
+            border-bottom: 1px solid rgba(255,255,255,.06);
+        }
+
+        #ebReadyStockPanel .eb-api-status.error {
+            color: #fca5a5;
+        }
+
+        #ebReadyStockPanel .eb-api-status.ok {
+            color: #86efac;
+        }
+
+        @media(max-width:1250px) {
+            #ebReadyStockPanel .eb-api-bar {
+                grid-template-columns: repeat(3, minmax(0, 1fr));
+            }
+        }
+
+        @media(max-width:900px) {
+            #ebReadyStockPanel .eb-api-bar {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 8px;
+            }
+            #ebReadyStockPanel .eb-api-field.eb-api-search-field,
+            #ebReadyStockPanel .eb-api-field.eb-api-button-field {
+                grid-column: span 2;
+            }
+        }
+
+        @media(max-width:700px) {
+            #ebReadyStockPanel .eb-api-bar {
+                grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+                gap: 8px;
+                padding: 9px;
+            }
+            #ebReadyStockPanel .eb-api-field,
+            #ebReadyStockPanel .eb-api-field.eb-api-search-field,
+            #ebReadyStockPanel .eb-api-field.eb-api-button-field {
+                grid-column: span 2;
+            }
+        }
+
+
+        /* Match the top result-filter search bar to the dark UI and align it
+           with the header controls. Override CRM global input[type=search] CSS. */
+        #ebReadyStockPanel input#ebReadySearch.eb-ready-search {
+            display: block !important;
+            box-sizing: border-box !important;
+            width: 100% !important;
+            min-width: 0 !important;
+            max-width: 100% !important;
+            height: 36px !important;
+            min-height: 36px !important;
+            max-height: 36px !important;
+            margin: 0 !important;
+            padding: 0 11px !important;
+            border: 1px solid rgba(255,255,255,.13) !important;
+            border-radius: 8px !important;
+            background: rgba(255,255,255,.07) !important;
+            color: #fff !important;
+            box-shadow: none !important;
+            outline: none !important;
+            font-family: inherit !important;
+            font-size: 12px !important;
+            font-weight: 500 !important;
+            line-height: 34px !important;
+            vertical-align: middle !important;
+            appearance: none !important;
+            -webkit-appearance: none !important;
+        }
+
+        #ebReadyStockPanel input#ebReadySearch.eb-ready-search::placeholder {
+            color: rgba(255,255,255,.45) !important;
+            opacity: 1 !important;
+        }
+
+        #ebReadyStockPanel input#ebReadySearch.eb-ready-search:focus {
+            border-color: rgba(34,197,94,.65) !important;
+            background: rgba(255,255,255,.10) !important;
+            box-shadow: 0 0 0 2px rgba(34,197,94,.10) !important;
+        }
+
+    `;
+
+    // =========================================================
+    // BASIC HELPERS
+    // =========================================================
+
+    function injectCSS() {
+        if (document.getElementById('ebReadyStockCSS')) return;
+
+        const style = document.createElement('style');
+        style.id = 'ebReadyStockCSS';
+        style.textContent = css;
+        document.head.appendChild(style);
+    }
+
+    function escapeHTML(value) {
+        return String(value || '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#039;');
+    }
+
+    function getNumber(text) {
+        if (!text) return 0;
+
+        const value = String(text)
+            .split('(')[0]
+            .trim();
+
+        const match = value.match(/-?\d+(?:[.,]\d+)?/);
+
+        if (!match) return 0;
+
+        const number = parseFloat(
+            match[0].replace(',', '.')
+        );
+
+        return Number.isFinite(number) ? number : 0;
+    }
+
+    // =========================================================
+    // PRODUCT
+    // =========================================================
+
+    function getProductName(row) {
+        const header = row.querySelector('th.row-header');
+
+        if (!header) {
+            return {
+                name: 'Unknown Product',
+                sku: ''
+            };
+        }
+
+        const link = header.querySelector('a');
+
+        let name = link
+            ? link.textContent.trim()
+            : header.textContent.trim();
+
+        const skuElement = header.querySelector('b');
+
+        const sku = skuElement
+            ? skuElement.textContent.trim()
+            : '';
+
+        name = name
+            .replace(/\s+/g, ' ')
+            .trim();
+
+        return {
+            name,
+            sku
+        };
+    }
+
+    // =========================================================
+    // STORE
+    // =========================================================
+
+    function getStoreInfo(cell) {
+        if (!cell) return null;
+
+        const classes = [...cell.classList];
+
+        const storeCode = classes.find(
+            c => /^\d+$/.test(c)
+        );
+
+        if (!storeCode) return null;
+
+        let unitLink = null;
+
+        try {
+            unitLink = document.querySelector(
+                `${CONFIG.tableSelector} a#ST${CSS.escape(String(storeCode))}`
+            );
+        } catch (e) {
+            unitLink = null;
+        }
+
+        let name = storeCode;
+
+        if (unitLink) {
+            name = unitLink.textContent
+                .replace(/\s+/g, ' ')
+                .trim();
+
+            name = name.replace(
+                new RegExp(
+                    '^' +
+                    storeCode +
+                    '\\s*-\\s*',
+                    'i'
+                ),
+                ''
+            );
+        }
+
+        return {
+            code: storeCode,
+            name,
+            unitLink
+        };
+    }
+
+    // =========================================================
+    // FIND ORIGINAL CRM CLICK TARGET
+    // =========================================================
+
+    function findClickableQty(cell, stock) {
+        if (!cell) return null;
+
+        const candidates = cell.querySelectorAll(
+            'a,button,[role="button"],[onclick],span,div'
+        );
+
+        for (const element of candidates) {
+            const text = element.textContent.trim();
+
+            if (!text || text.length > 30) continue;
+
+            const number = getNumber(text);
+
+            if (number !== stock) continue;
+
+            let clickable = element.matches(
+                'a,button,[role="button"],[onclick]'
+            );
+
+            if (!clickable) {
+                try {
+                    clickable =
+                        window.getComputedStyle(element).cursor === 'pointer';
+                } catch (e) {
+                    clickable = false;
+                }
+            }
+
+            if (clickable) return element;
+        }
+
+        const links = cell.querySelectorAll('a');
+
+        for (const link of links) {
+            if (
+                getNumber(link.textContent) === stock
+            ) {
+                return link;
+            }
+        }
+
+        return cell;
+    }
+
+    // =========================================================
+    // SCAN TABLE
+    // =========================================================
+
+    function scanTable() {
+        const table = document.querySelector(
+            CONFIG.tableSelector
+        );
+
+        /*
+         * Kalau table hilang sementara karena pagination/AJAX,
+         * langsung kosongkan data agar tidak menampilkan data lama.
+         */
+        if (!table) {
+            inventoryData = [];
+            render();
+            currentTable = null;
+            return false;
+        }
+
+        if (table !== currentTable) {
+            bindTableObserver(table);
+        }
+
+        const rows = table.querySelectorAll(
+            'tbody tr'
+        );
+
+        if (!rows.length) {
+            inventoryData = [];
+            render();
+            return false;
+        }
+
+        const readyItems = [];
+
+        rows.forEach(row => {
+            const header = row.querySelector(
+                'th.row-header'
+            );
+
+            if (!header) return;
+
+            const cells = row.querySelectorAll('td');
+
+            if (!cells.length) return;
+
+            const product = getProductName(row);
+
+            const readyStores = [];
+
+            let totalStock = 0;
+
+            cells.forEach((cell, index) => {
+                /*
+                 * Cell pertama = total.
+                 */
+                if (index === 0) return;
+
+                const stock = getNumber(
+                    cell.textContent
+                );
+
+                if (stock <= 0) return;
+
+                const store = getStoreInfo(cell);
+
+                if (!store) return;
+
+                const qtyElement =
+                    findClickableQty(
+                        cell,
+                        stock
+                    );
+
+                totalStock += stock;
+
+                readyStores.push({
+                    code: store.code,
+                    name: store.name,
+                    stock,
+                    qtyCell: cell,
+                    qtyElement,
+                    unitLink: store.unitLink
+                });
+            });
+
+            const displayedTotal = getNumber(
+                cells[0].textContent
+            );
+
+            if (
+                displayedTotal > 0 &&
+                totalStock === 0
+            ) {
+                totalStock = displayedTotal;
+            }
+
+            row.classList.remove(
+                'eb-ready-row'
+            );
+
+            if (
+                totalStock >= CONFIG.minStock
+            ) {
+                row.classList.add(
+                    'eb-ready-row'
+                );
+
+                readyItems.push({
+                    row,
+                    name: product.name,
+                    sku: product.sku,
+                    total: totalStock,
+                    stores: readyStores
+                });
+            }
+        });
+
+        inventoryData = readyItems;
+
+        lastSignature = getTableSignature(table);
+
+        render();
+
+        return true;
+    }
+
+    // =========================================================
+    // SEARCH
+    // =========================================================
+
+    function getTokens() {
+        return String(currentSearch || '')
+            .split(',')
+            .map(x =>
+                x
+                    .toLowerCase()
+                    .replace(/\s+/g, ' ')
+                    .trim()
+            )
+            .filter(Boolean);
+    }
+
+    function textMatch(value, token) {
+        return String(value || '')
+            .toLowerCase()
+            .replace(/\s+/g, ' ')
+            .includes(token);
+    }
+
+    function getFilteredItems() {
+        const tokens = getTokens();
+
+        if (!tokens.length) {
+            return inventoryData;
+        }
+
+        return inventoryData
+            .map(item => {
+                const productMatched =
+                    tokens.some(token =>
+                        textMatch(
+                            item.name,
+                            token
+                        ) ||
+                        textMatch(
+                            item.sku,
+                            token
+                        )
+                    );
+
+                const matchedStores =
+                    item.stores.filter(store =>
+                        tokens.some(token =>
+                            textMatch(
+                                store.name,
+                                token
+                            ) ||
+                            textMatch(
+                                store.code,
+                                token
+                            )
+                        )
+                    );
+
+                if (
+                    !productMatched &&
+                    matchedStores.length === 0
+                ) {
+                    return null;
+                }
+
+                const hasStoreFilter =
+                    matchedStores.length > 0;
+
+                return {
+                    ...item,
+                    stores: hasStoreFilter
+                        ? matchedStores
+                        : item.stores
+                };
+            })
+            .filter(Boolean)
+            .filter(
+                item => item.stores.length > 0
+            );
+    }
+
+    // =========================================================
+    // FIND CURRENT ORIGINAL TARGET
+    // =========================================================
+
+    function findCurrentQtyTarget(row, store) {
+        if (!row || !store) return null;
+
+        const cells = row.querySelectorAll('td');
+
+        for (const cell of cells) {
+            const info = getStoreInfo(cell);
+
+            if (!info) continue;
+
+            if (
+                String(info.code) !==
+                String(store.code)
+            ) {
+                continue;
+            }
+
+            const stock = getNumber(
+                cell.textContent
+            );
+
+            /*
+             * Jangan terlalu bergantung pada angka stock.
+             * Kalau DOM berubah dan qty masih ada, tetap gunakan
+             * cell toko yang benar.
+             */
+            if (
+                stock === Number(store.stock)
+            ) {
+                return findClickableQty(
+                    cell,
+                    stock
+                );
+            }
+
+            /*
+             * Fallback jika angka berubah setelah refresh.
+             */
+            const target =
+                findClickableQty(
+                    cell,
+                    stock
+                );
+
+            if (target) return target;
+        }
+
+        return null;
+    }
+
+    // =========================================================
+    // CLICK ORIGINAL CRM
+    // =========================================================
+
+    function clickOriginalQty(store, row) {
+        let target = null;
+
+        if (
+            store &&
+            store.qtyElement &&
+            document.contains(store.qtyElement)
+        ) {
+            target = store.qtyElement;
+        }
+
+        /*
+         * DOM mungkin sudah diganti CRM.
+         */
+        if (!target) {
+            target = findCurrentQtyTarget(
+                row,
+                store
+            );
+        }
+
+        /*
+         * Kalau belum ketemu, scan terbaru lalu cari lagi.
+         */
+        if (!target && row) {
+            scanTable();
+
+            target = findCurrentQtyTarget(
+                row,
+                store
+            );
+        }
+
+        if (!target) {
+            jumpToRow(row);
+            return;
+        }
+
+        try {
+            target.scrollIntoView({
+                behavior: 'smooth',
+                block: 'center',
+                inline: 'center'
+            });
+        } catch (e) {}
+
+        const oldBg = target.style.background;
+        const oldShadow = target.style.boxShadow;
+
+        target.style.background =
+            'rgba(34,197,94,.45)';
+
+        target.style.boxShadow =
+            '0 0 0 2px rgba(34,197,94,.5)';
+
+        setTimeout(() => {
+            try {
+                target.click();
+            } catch (e) {
+                try {
+                    target.dispatchEvent(
+                        new MouseEvent(
+                            'click',
+                            {
+                                bubbles: true,
+                                cancelable: true,
+                                view: window
+                            }
+                        )
+                    );
+                } catch (e2) {}
+            }
+        }, 80);
+
+        setTimeout(() => {
+            try {
+                target.style.background = oldBg;
+                target.style.boxShadow = oldShadow;
+            } catch (e) {}
+        }, 900);
+    }
+
+    // =========================================================
+    // JUMP ROW
+    // =========================================================
+
+    function jumpToRow(row) {
+        if (!row) return;
+
+        try {
+            row.scrollIntoView({
+                behavior: 'smooth',
+                block: 'center'
+            });
+        } catch (e) {}
+    }
+
+    // =========================================================
+    // SKU VIEW
+    // =========================================================
+
+    function renderSKU(list, items) {
+        list.innerHTML = '';
+
+        items.forEach(item => {
+            const card =
+                document.createElement('div');
+
+            card.className =
+                'eb-ready-card';
+
+            const total =
+                item.stores.reduce(
+                    (sum, store) =>
+                        sum +
+                        Number(
+                            store.stock || 0
+                        ),
+                    0
+                );
+
+            card.innerHTML = `
+                <div
+                    class="eb-ready-product"
+                    title="${escapeHTML(item.name)}"
+                >
+                    ${escapeHTML(item.name)}
+                </div>
+
+                <div class="eb-ready-sku">
+                    ${escapeHTML(item.sku)}
+                </div>
+
+                <div class="eb-ready-info">
+                    <div class="eb-ready-stock">
+                        ${total}
+                        <small>stock</small>
+                    </div>
+
+                    <div class="eb-ready-store-count">
+                        ${item.stores.length} TOKO
+                    </div>
+                </div>
+
+                <div class="eb-ready-store-list"></div>
+            `;
+
+            const storeList =
+                card.querySelector(
+                    '.eb-ready-store-list'
+                );
+
+            [...item.stores]
+                .sort(
+                    (a, b) =>
+                        b.stock - a.stock
+                )
+                .forEach(store => {
+                    const storeRow =
+                        document.createElement('div');
+
+                    storeRow.className =
+                        'eb-ready-store-row';
+
+                    storeRow.innerHTML = `
+                        <span
+                            class="eb-ready-store-name"
+                            title="${escapeHTML(store.name)}"
+                        >
+                            ${escapeHTML(store.name)}
+                        </span>
+
+                        <span
+                            class="eb-ready-store-qty"
+                        >
+                            ${store.stock}
+                        </span>
+                    `;
+
+                    /*
+                     * =================================================
+                     * PENTING:
+                     * NAMA TOKO SEKARANG JUGA KLIK QTY ASLI CRM.
+                     * Tidak lagi hanya scroll ke row.
+                     * =================================================
+                     */
+                    storeRow.addEventListener(
+                        'click',
+                        function(event) {
+                            event.preventDefault();
+                            event.stopPropagation();
+
+                            clickOriginalQty(
+                                store,
+                                item.row
+                            );
+                        }
+                    );
+
+                    storeList.appendChild(
+                        storeRow
+                    );
+                });
+
+            /*
+             * Klik card/product/SKU juga menuju
+             * row asli CRM.
+             */
+            card.addEventListener(
+                'click',
+                function(event) {
+                    if (
+                        event.target.closest(
+                            '.eb-ready-store-row'
+                        )
+                    ) {
+                        return;
+                    }
+
+                    jumpToRow(item.row);
+                }
+            );
+
+            list.appendChild(card);
+        });
+    }
+
+    // =========================================================
+    // TOKO VIEW
+    // =========================================================
+
+    function renderStore(list, items) {
+        list.innerHTML = '';
+
+        const stores = {};
+
+        items.forEach(item => {
+            item.stores.forEach(store => {
+                const key =
+                    String(store.code) ||
+                    store.name;
+
+                if (!stores[key]) {
+                    stores[key] = {
+                        code: store.code,
+                        name: store.name,
+                        products: []
+                    };
+                }
+
+                stores[key].products.push({
+                    item,
+                    store
+                });
+            });
+        });
+
+        Object.values(stores)
+            .forEach(store => {
+                const group =
+                    document.createElement('div');
+
+                group.className =
+                    'eb-store-group';
+
+                group.innerHTML = `
+                    <div class="eb-store-header">
+                        <div class="eb-store-title">
+                            <span
+                                class="eb-store-name"
+                                title="${escapeHTML(store.name)}"
+                            >
+                                ${escapeHTML(store.name)}
+                            </span>
+                        </div>
+                    </div>
+
+                    <div class="eb-store-products"></div>
+                `;
+
+                /*
+                 * Klik nama toko = klik QTY asli CRM
+                 * untuk toko tersebut.
+                 */
+                group.querySelector(
+                    '.eb-store-name'
+                ).addEventListener(
+                    'click',
+                    function(event) {
+                        event.preventDefault();
+                        event.stopPropagation();
+
+                        const first =
+                            store.products[0];
+
+                        if (first) {
+                            clickOriginalQty(
+                                first.store,
+                                first.item.row
+                            );
+                        }
+                    }
+                );
+
+                const productsContainer =
+                    group.querySelector(
+                        '.eb-store-products'
+                    );
+
+                store.products
+                    .sort(
+                        (a, b) =>
+                            a.item.name.localeCompare(
+                                b.item.name
+                            )
+                    )
+                    .forEach(product => {
+                        const productRow =
+                            document.createElement('div');
+
+                        productRow.className =
+                            'eb-store-product';
+
+                        productRow.innerHTML = `
+                            <div
+                                class="eb-store-product-info"
+                                title="${escapeHTML(product.item.name)}"
+                            >
+                                <div
+                                    class="eb-store-product-name"
+                                >
+                                    ${escapeHTML(
+                                        product.item.name
+                                    )}
+                                </div>
+
+                                <div
+                                    class="eb-store-product-sku"
+                                >
+                                    ${escapeHTML(
+                                        product.item.sku
+                                    )}
+                                </div>
+                            </div>
+
+                            <div
+                                class="eb-store-product-qty"
+                            >
+                                ${product.store.stock}
+                            </div>
+                        `;
+
+                        /*
+                         * =================================================
+                         * PENTING:
+                         * Di TOKO VIEW, klik nama SKU/produk sekarang
+                         * langsung klik QTY asli CRM.
+                         * =================================================
+                         */
+                        productRow
+                            .querySelector(
+                                '.eb-store-product-info'
+                            )
+                            .addEventListener(
+                                'click',
+                                function(event) {
+                                    event.preventDefault();
+                                    event.stopPropagation();
+
+                                    clickOriginalQty(
+                                        product.store,
+                                        product.item.row
+                                    );
+                                }
+                            );
+
+                        /*
+                         * Angka stock tetap bisa diklik.
+                         */
+                        productRow
+                            .querySelector(
+                                '.eb-store-product-qty'
+                            )
+                            .addEventListener(
+                                'click',
+                                function(event) {
+                                    event.preventDefault();
+                                    event.stopPropagation();
+
+                                    clickOriginalQty(
+                                        product.store,
+                                        product.item.row
+                                    );
+                                }
+                            );
+
+                        productsContainer.appendChild(
+                            productRow
+                        );
+                    });
+
+                list.appendChild(group);
+            });
+
+        if (!Object.keys(stores).length) {
+            list.innerHTML = `
+                <div class="eb-ready-empty">
+                    Tidak ada toko ready
+                    yang cocok.
+                </div>
+            `;
+        }
+    }
+
+    // =========================================================
+    // RENDER
+    // =========================================================
+
+    function render() {
+        const panel =
+            document.getElementById(
+                CONFIG.panelId
+            );
+
+        if (!panel) return;
+
+        const list =
+            document.getElementById(
+                'ebReadyList'
+            );
+
+        const count =
+            document.getElementById(
+                'ebReadyCount'
+            );
+
+        if (!list || !count) return;
+
+        const items =
+            getFilteredItems();
+
+        count.textContent = items.length;
+
+        panel.classList.remove(
+            'eb-view-sku',
+            'eb-view-store'
+        );
+
+        panel.classList.add(
+            currentView === 'sku'
+                ? 'eb-view-sku'
+                : 'eb-view-store'
+        );
+
+        if (!items.length) {
+            list.innerHTML = `
+                <div class="eb-ready-empty">
+                    ${
+                        currentSearch
+                            ? 'Tidak ada data yang cocok dengan filter.'
+                            : 'Tidak ada barang ready di halaman CRM.'
+                    }
+                </div>
+            `;
+            return;
+        }
+
+        if (currentView === 'sku') {
+            renderSKU(list, items);
+        } else {
+            renderStore(list, items);
+        }
+    }
+
+    // =========================================================
+    // PANEL
+    // =========================================================
+
+
+    // =========================================================
+    // DIRECT CRM REQUEST UI
+    // =========================================================
+
+    const API_PROVINCES = [{"id": "195", "name": "Jawa Barat"}, {"id": "1034", "name": "Sumatera Utara"}, {"id": "1043", "name": "Bengkulu"}, {"id": "1041", "name": "Lampung"}, {"id": "1037", "name": "Riau"}, {"id": "1035", "name": "Nanggroe Aceh Darussalam (NAD)"}, {"id": "1036", "name": "Sumatera Barat"}, {"id": "1042", "name": "Jambi"}, {"id": "1048", "name": "Kalimantan Tengah"}, {"id": "1038", "name": "Kepulauan Riau"}, {"id": "1039", "name": "Sumatera Selatan"}, {"id": "1056", "name": "Sulawesi Barat"}, {"id": "1053", "name": "Nusa Tenggara Barat (NTB)"}, {"id": "1045", "name": "DI Yogyakarta"}, {"id": "1046", "name": "Jawa Timur"}, {"id": "1055", "name": "Sulawesi Selatan"}, {"id": "1061", "name": "Maluku"}, {"id": "1044", "name": "Jawa Tengah"}, {"id": "1051", "name": "Kalimantan Barat"}, {"id": "1050", "name": "Kalimantan Utara"}, {"id": "1040", "name": "Bangka Belitung"}, {"id": "1059", "name": "Sulawesi Utara"}, {"id": "1057", "name": "Sulawesi Tenggara"}, {"id": "1047", "name": "Kalimantan Selatan"}, {"id": "1060", "name": "Gorontalo"}, {"id": "1049", "name": "Kalimantan Timur"}, {"id": "1052", "name": "Bali"}, {"id": "1054", "name": "Nusa Tenggara Timur (NTT)"}, {"id": "1063", "name": "Papua"}, {"id": "1058", "name": "Sulawesi Tengah"}, {"id": "1062", "name": "Maluku Utara"}, {"id": "1064", "name": "Papua Barat"}, {"id": "1065", "name": "Aceh"}, {"id": "1066", "name": "Kepulauan Bangka Belitung"}, {"id": "1067", "name": "Daerah Istimewa Yogyakarta"}, {"id": "1068", "name": "Nusa Tenggara Barat"}, {"id": "1069", "name": "Nusa Tenggara Timur"}, {"id": "1070", "name": "Kalimantan Timur"}, {"id": "192", "name": "Banten"}, {"id": "193", "name": "DKI Jakarta"}];
+
+    const apiState = {
+        province: new Map(),
+        store: new Map(),
+        category: new Map(),
+        storeAll: [],
+        categoryAll: [],
+        loading: false
+    };
+
+    function setApiStatus(message, isError) {
+        const el = document.getElementById('ebApiStatusText');
+        if (!el) return;
+
+        el.textContent = message;
+        el.classList.toggle('error', !!isError);
+        el.classList.toggle('ok', !isError);
+    }
+
+    function closeApiMenus() {
+        document.querySelectorAll(
+            '#' + CONFIG.panelId + ' .eb-api-field.open'
+        ).forEach(field => field.classList.remove('open'));
+    }
+
+    function setupApiDropdown(type) {
+        const field = document.getElementById('ebApi' + capitalize(type) + 'Field');
+        if (!field) return;
+
+        const trigger = field.querySelector('.eb-api-trigger');
+        const menu = field.querySelector('.eb-api-menu');
+        const search = field.querySelector('.eb-api-menu-search');
+        const options = field.querySelector('.eb-api-options');
+
+        trigger.addEventListener('click', function (event) {
+            event.preventDefault();
+            event.stopPropagation();
+
+            document.querySelectorAll(
+                '#' + CONFIG.panelId + ' .eb-api-field.open'
+            ).forEach(other => {
+                if (other !== field) other.classList.remove('open');
+            });
+
+            field.classList.toggle('open');
+        });
+
+        menu.addEventListener('click', function (event) {
+            event.stopPropagation();
+        });
+
+        search.addEventListener('input', function () {
+            const needle = normalizeText(this.value);
+
+            options.querySelectorAll('.eb-api-option').forEach(option => {
+                const text = normalizeText(option.textContent);
+                option.style.display =
+                    !needle || text.includes(needle) ? 'flex' : 'none';
+            });
+        });
+
+        field.querySelector('[data-action="all"]').addEventListener('click', function () {
+            const map = apiState[type];
+
+            if (type === 'province') {
+                map.clear();
+                API_PROVINCES.forEach(item => map.set(String(item.id), item));
+                renderApiOptions(type);
+                loadStoresForSelectedProvinces(true);
+                return;
+            }
+
+            if (type === 'store') {
+                apiState.storeAll.forEach(item => map.set(String(item.id), item));
+            } else if (type === 'category') {
+                apiState.categoryAll.forEach(item => map.set(String(item.id), item));
+            }
+
+            renderApiOptions(type);
+        });
+
+        field.querySelector('[data-action="clear"]').addEventListener('click', function () {
+            apiState[type].clear();
+            renderApiOptions(type);
+
+            if (type === 'province') {
+                loadStoresForSelectedProvinces(false);
+            }
+        });
+    }
+
+    function capitalize(value) {
+        return value.charAt(0).toUpperCase() + value.slice(1);
+    }
+
+    function normalizeText(value) {
+        return String(value || '')
+            .toLowerCase()
+            .normalize('NFD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function escapeHTML(value) {
+        return String(value || '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#039;');
+    }
+
+    function populateProvinceOptions() {
+        apiState.province.clear();
+        renderApiOptions('province');
+    }
+
+    function renderApiOptions(type) {
+        const options = document.getElementById(
+            'ebApi' + capitalize(type) + 'Options'
+        );
+
+        if (!options) return;
+
+        let data = [];
+
+        if (type === 'province') data = API_PROVINCES;
+        if (type === 'store') data = apiState.storeAll;
+        if (type === 'category') data = apiState.categoryAll;
+
+        options.innerHTML = '';
+
+        if (!data.length) {
+            options.innerHTML = '<div style="padding:12px;color:rgba(255,255,255,.45);font-size:10px;">Tidak ada data.</div>';
+            updateApiTrigger(type);
+            return;
+        }
+
+        const selected = apiState[type];
+
+        data.forEach(item => {
+            const id = String(item.id);
+
+            const label = document.createElement('label');
+            label.className = 'eb-api-option';
+
+            label.innerHTML = `
+                <input type="checkbox" value="${escapeHTML(id)}" ${selected.has(id) ? 'checked' : ''}>
+                <span>${escapeHTML(item.name)}</span>
+            `;
+
+            const checkbox = label.querySelector('input');
+
+            checkbox.addEventListener('change', function () {
+                if (this.checked) {
+                    selected.set(id, item);
+                } else {
+                    selected.delete(id);
+                }
+
+                updateApiTrigger(type);
+
+                if (type === 'province') {
+                    loadStoresForSelectedProvinces(true);
+                }
+            });
+
+            options.appendChild(label);
+        });
+
+        updateApiTrigger(type);
+    }
+
+    function updateApiTrigger(type) {
+        const trigger = document.getElementById(
+            'ebApi' + capitalize(type) + 'Trigger'
+        );
+
+        if (!trigger) return;
+
+        const selected = apiState[type];
+        const all =
+            type === 'province'
+                ? API_PROVINCES
+                : type === 'store'
+                    ? apiState.storeAll
+                    : apiState.categoryAll;
+
+        if (!selected.size) {
+            trigger.textContent =
+                type === 'province'
+                    ? 'Semua Provinsi'
+                    : type === 'store'
+                        ? 'Semua Toko'
+                        : 'Semua Kategori';
+            return;
+        }
+
+        if (selected.size === all.length) {
+            trigger.textContent =
+                type === 'province'
+                    ? 'Semua Provinsi (' + all.length + ')'
+                    : type === 'store'
+                        ? 'Semua Toko (' + all.length + ')'
+                        : 'Semua Kategori (' + all.length + ')';
+            return;
+        }
+
+        const first = Array.from(selected.values())[0];
+        trigger.textContent =
+            selected.size === 1
+                ? first.name
+                : selected.size + ' dipilih';
+    }
+
+    async function loadAllCategories() {
+        setApiStatus('Memuat semua kategori dari CRM...', false);
+
+        try {
+            const response = await fetch(
+                '/AjaxApi/GetAllMaingroup',
+                {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: {
+                        'Content-Type': 'application/json; charset=utf-8',
+                        'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    body: '{}'
+                }
+            );
+
+            if (!response.ok) {
+                throw new Error('HTTP ' + response.status);
+            }
+
+            const data = await response.json();
+
+            apiState.categoryAll = Array.isArray(data)
+                ? data
+                    .map(item => ({
+                        id: item.MAINGROUPID,
+                        name: item.MAINGROUPNAME
+                    }))
+                    .filter(item => item.id !== undefined && item.name)
+                : [];
+
+            apiState.category.clear();
+            renderApiOptions('category');
+
+            setApiStatus(
+                'Kategori CRM siap: ' + apiState.categoryAll.length + ' data.',
+                false
+            );
+        } catch (error) {
+            console.error('[EraBlue Ready Stock] category API error:', error);
+            setApiStatus('Gagal memuat kategori CRM: ' + error.message, true);
+        }
+    }
+
+    async function loadStoresForSelectedProvinces(selectAll) {
+        const provinceIds = Array.from(apiState.province.keys());
+        const lstProvince = provinceIds.length
+            ? provinceIds.join(',') + ','
+            : '';
+
+        setApiStatus(
+            provinceIds.length
+                ? 'Memuat toko sesuai ' + provinceIds.length + ' provinsi...'
+                : 'Memuat semua toko dari CRM...',
+            false
+        );
+
+        try {
+            const response = await fetch(
+                '/AjaxApi/GetAllERPPMStores_string',
+                {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                        'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    body: new URLSearchParams({
+                        lstProvince: lstProvince,
+                        type: selectAll ? 'true' : 'false'
+                    }).toString()
+                }
+            );
+
+            if (!response.ok) {
+                throw new Error('HTTP ' + response.status);
+            }
+
+            const data = await response.json();
+            const temp = document.createElement('select');
+
+            temp.innerHTML = data && data.html ? data.html : '';
+
+            apiState.storeAll = Array.from(temp.options)
+                .map(option => ({
+                    id: option.value,
+                    name: option.textContent.replace(/\s+/g, ' ').trim()
+                }))
+                .filter(item => item.id !== '' && item.name);
+
+            /*
+             * Bila provinsi dipilih, semua toko hasil provinsi otomatis
+             * dipilih supaya filter provinsi benar-benar diterapkan
+             * pada endpoint CheckInventory_View.
+             *
+             * Bila tidak ada provinsi, kosong = semua toko CRM.
+             */
+            apiState.store.clear();
+
+            if (provinceIds.length || selectAll) {
+                apiState.storeAll.forEach(item => {
+                    apiState.store.set(String(item.id), item);
+                });
+            }
+
+            renderApiOptions('store');
+
+            setApiStatus(
+                'Toko CRM siap: ' + apiState.storeAll.length + ' data.',
+                false
+            );
+        } catch (error) {
+            console.error('[EraBlue Ready Stock] store API error:', error);
+            apiState.storeAll = [];
+            apiState.store.clear();
+            renderApiOptions('store');
+            setApiStatus('Gagal memuat daftar toko CRM: ' + error.message, true);
+        }
+    }
+
+    function getApiCsv(type) {
+        return Array.from(apiState[type].keys()).join(',') +
+            (apiState[type].size ? ',' : '');
+    }
+
+    async function requestInventoryFromCRM() {
+        if (apiState.loading) return;
+
+        const input = document.getElementById('ebApiSearch');
+        const status = document.getElementById('ebApiStatus');
+        const button = document.getElementById('ebApiSearchBtn');
+
+        if (!input || !status || !button) return;
+
+        const key = input.value.trim();
+
+        if (key.length < 4) {
+            setApiStatus(
+                'Search CRM membutuhkan minimal 4 karakter.',
+                true
+            );
+            input.focus();
+            return;
+        }
+
+        if (key.length > 100) {
+            setApiStatus(
+                'Search CRM maksimal 100 karakter.',
+                true
+            );
+            input.focus();
+            return;
+        }
+
+        closeApiMenus();
+
+        apiState.loading = true;
+        button.classList.add('eb-loading');
+        button.textContent = '...';
+
+        const lstStore = getApiCsv('store');
+        const lstMainGroup = getApiCsv('category');
+        const inventoryStatusID = status.value || '1';
+
+        /*
+         * Sama dengan parameter CheckInventory_View pada source CRM.
+         * ProductIDRef/SiteID sengaja 0/kosong karena search UI ini
+         * memakai keyword langsung.
+         */
+        const payload = new URLSearchParams({
+            lstStore: lstStore,
+            lstMainGroup: lstMainGroup,
+            key: key,
+            typeSort: '1',
+            inventoryStatusID: inventoryStatusID,
+            ProductIDRef: '0',
+            rangeType: '-1',
+            SiteID: '',
+            IsCheckInventory: '0'
+        });
+
+        setApiStatus(
+            'Request CRM: ' +
+            key +
+            ' | toko=' +
+            (apiState.store.size || 'ALL') +
+            ' | kategori=' +
+            (apiState.category.size || 'ALL'),
+            false
+        );
+
+        try {
+            const response = await fetch(
+                '/SaleOrder/CheckInventory_View',
+                {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                        'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    body: payload.toString()
+                }
+            );
+
+            if (!response.ok) {
+                throw new Error('HTTP ' + response.status);
+            }
+
+            const html = await response.text();
+
+            let inventory = document.getElementById('divInventory');
+
+            /*
+             * Jika user menekan SEARCH sebelum CRM selesai membuat
+             * container hasil, buat host sementara di panel.
+             * Saat CRM #divInventory muncul, hasil berikutnya otomatis
+             * akan kembali masuk ke container CRM asli.
+             */
+            if (!inventory) {
+                inventory = document.createElement('div');
+                inventory.id = 'ebApiResultHost';
+                inventory.className = 'scrollable-table';
+                inventory.style.cssText =
+                    'position:fixed;left:18px;right:18px;top:20px;bottom:470px;' +
+                    'z-index:2147483000;overflow:auto;background:#fff;color:#111;' +
+                    'border:1px solid #ddd;border-radius:10px;padding:8px;';
+
+                document.body.appendChild(inventory);
+            }
+
+            inventory.innerHTML = html;
+
+            /*
+             * CRM menaruh hidden product list di hasil HTML.
+             * Gunakan fungsi original CRM bila tersedia.
+             */
+            try {
+                const productList = document.getElementById('hdLstProduct');
+
+                if (
+                    productList &&
+                    typeof window.GetURLForProduct === 'function'
+                ) {
+                    window.GetURLForProduct(productList.value || '');
+                }
+            } catch (e) {
+                console.warn(
+                    '[EraBlue Ready Stock] GetURLForProduct:',
+                    e
+                );
+            }
+
+            currentTable = null;
+            lastSignature = '';
+            scheduleScan(80);
+
+            setTimeout(() => scanTable(), 250);
+            setTimeout(() => scanTable(), 800);
+            setTimeout(() => scanTable(), 1500);
+
+            setApiStatus(
+                'Search selesai. Hasil CRM sudah dimuat ke table.',
+                false
+            );
+        } catch (error) {
+            console.error(
+                '[EraBlue Ready Stock] inventory API error:',
+                error
+            );
+
+            setApiStatus(
+                'Request inventory gagal: ' + error.message,
+                true
+            );
+        } finally {
+            apiState.loading = false;
+            button.classList.remove('eb-loading');
+            button.textContent = 'SEARCH';
+        }
+    }
+
+function createPanel() {
+        if (document.getElementById(CONFIG.panelId)) return;
+
+        const panel = document.createElement('div');
+        panel.id = CONFIG.panelId;
+
+        panel.innerHTML = `
+            <div class="eb-ready-header">
+                <div class="eb-ready-title">
+                    <span class="eb-ready-dot"></span>
+                    READY STOCK
+                    <span class="eb-ready-count" id="ebReadyCount">0</span>
+                </div>
+
+                <div class="eb-ready-view-switch">
+                    <button type="button" class="eb-ready-view-btn active" data-view="sku">SKU VIEW</button>
+                    <button type="button" class="eb-ready-view-btn" data-view="store">TOKO VIEW</button>
+                </div>
+
+                <input type="search" class="eb-ready-search" id="ebReadySearch"
+                       placeholder="Filter hasil: SKU / barang / toko, pisahkan dengan koma..."
+                       autocomplete="off">
+
+                <button type="button" class="eb-ready-btn" id="ebReadyRefresh" title="Scan table">↻</button>
+                <button type="button" class="eb-ready-btn" id="ebReadyCollapse" title="Minimize">−</button>
+            </div>
+
+            <div class="eb-api-bar" id="ebApiBar">
+                <div class="eb-api-field">
+                    <select id="ebApiStatus" class="eb-api-input" aria-label="Status">
+                        <option value="1" selected>New</option>
+                        <option value="8">New (Discounted)</option>
+                    </select>
+                </div>
+
+                <div class="eb-api-field" id="ebApiProvinceField">
+                    <button type="button" class="eb-api-trigger" id="ebApiProvinceTrigger">Semua Provinsi</button>
+                    <div class="eb-api-menu">
+                        <div class="eb-api-menu-tools">
+                            <input class="eb-api-menu-search" type="search" placeholder="Cari provinsi...">
+                            <button type="button" class="eb-api-menu-action" data-action="all">ALL</button>
+                            <button type="button" class="eb-api-menu-action" data-action="clear">CLEAR</button>
+                        </div>
+                        <div class="eb-api-options" id="ebApiProvinceOptions"></div>
+                    </div>
+                </div>
+
+                <div class="eb-api-field" id="ebApiStoreField">
+                    <button type="button" class="eb-api-trigger" id="ebApiStoreTrigger">Semua Toko</button>
+                    <div class="eb-api-menu">
+                        <div class="eb-api-menu-tools">
+                            <input class="eb-api-menu-search" type="search" placeholder="Cari toko...">
+                            <button type="button" class="eb-api-menu-action" data-action="all">ALL</button>
+                            <button type="button" class="eb-api-menu-action" data-action="clear">CLEAR</button>
+                        </div>
+                        <div class="eb-api-options" id="ebApiStoreOptions"></div>
+                    </div>
+                </div>
+
+                <div class="eb-api-field" id="ebApiCategoryField">
+                    <button type="button" class="eb-api-trigger" id="ebApiCategoryTrigger">Semua Kategori</button>
+                    <div class="eb-api-menu">
+                        <div class="eb-api-menu-tools">
+                            <input class="eb-api-menu-search" type="search" placeholder="Cari kategori...">
+                            <button type="button" class="eb-api-menu-action" data-action="all">ALL</button>
+                            <button type="button" class="eb-api-menu-action" data-action="clear">CLEAR</button>
+                        </div>
+                        <div class="eb-api-options" id="ebApiCategoryOptions"></div>
+                    </div>
+                </div>
+
+                <div class="eb-api-field eb-api-search-field">
+                    <input type="search" class="eb-api-input" id="ebApiSearch"
+                           placeholder="SKU / Product ID / nama barang (min. 4 karakter)"
+                           autocomplete="off">
+                </div>
+
+                <div class="eb-api-field eb-api-button-field">
+                    <button type="button" class="eb-api-btn" id="ebApiSearchBtn">SEARCH</button>
+                </div>
+            </div>
+
+            <div class="eb-api-status" id="ebApiStatusText">
+                Siap. Filter di atas menggunakan request CRM langsung.
+            </div>
+
+            <div class="eb-ready-list" id="ebReadyList"></div>
+        `;
+
+        document.body.appendChild(panel);
+
+        panel.querySelectorAll('[data-view]').forEach(button => {
+            button.addEventListener('click', function () {
+                currentView = this.dataset.view;
+
+                panel.querySelectorAll('[data-view]').forEach(btn => {
+                    btn.classList.remove('active');
+                });
+
+                this.classList.add('active');
+                render();
+            });
+        });
+
+        panel.querySelector('#ebReadySearch').addEventListener('input', function () {
+            currentSearch = this.value;
+            render();
+        });
+
+        panel.querySelector('#ebReadyRefresh').addEventListener('click', function () {
+            this.textContent = '...';
+            scanTable();
+
+            setTimeout(() => {
+                this.textContent = '↻';
+            }, 350);
+        });
+
+        panel.querySelector('#ebReadyCollapse').addEventListener('click', function () {
+            panel.classList.toggle('eb-collapsed');
+
+            this.textContent =
+                panel.classList.contains('eb-collapsed') ? '+' : '−';
+        });
+
+        setupApiDropdown('province');
+        setupApiDropdown('store');
+        setupApiDropdown('category');
+
+        populateProvinceOptions();
+        loadAllCategories();
+        loadStoresForSelectedProvinces(false);
+
+        panel.querySelector('#ebApiSearchBtn').addEventListener('click', requestInventoryFromCRM);
+
+        panel.querySelector('#ebApiSearch').addEventListener('keydown', function (event) {
+            if (event.key === 'Enter') {
+                event.preventDefault();
+                requestInventoryFromCRM();
+            }
+        });
+
+        panel.querySelector('#ebApiStatus').addEventListener('change', function () {
+            setApiStatus('Status diubah ke ' + this.options[this.selectedIndex].text + '. Tekan SEARCH untuk request.', false);
+        });
+
+        document.addEventListener('click', function (event) {
+            if (!event.target.closest('#' + CONFIG.panelId + ' .eb-api-field')) {
+                panel.querySelectorAll('.eb-api-field.open').forEach(field => {
+                    field.classList.remove('open');
+                });
+            }
+        }, true);
+
+        render();
+    }
+
+    // =========================================================
+    // TABLE SIGNATURE
+    // =========================================================
+
+    function getTableSignature(table) {
+        if (!table) return '';
+
+        const rows =
+            table.querySelectorAll(
+                'tbody tr'
+            );
+
+        let result = '';
+
+        /*
+         * Signature dibuat ringan tetapi cukup untuk mendeteksi:
+         * - pagination
+         * - search
+         * - perubahan stock
+         * - perubahan SKU
+         * - perubahan toko
+         */
+        rows.forEach(row => {
+            result += '|';
+
+            const header =
+                row.querySelector(
+                    'th.row-header'
+                );
+
+            if (header) {
+                result +=
+                    header.textContent
+                        .replace(/\s+/g, ' ')
+                        .trim();
+            }
+
+            row.querySelectorAll('td')
+                .forEach(cell => {
+                    result += '§';
+                    result +=
+                        cell.className || '';
+                    result += ':';
+                    result +=
+                        cell.textContent
+                            .replace(/\s+/g, ' ')
+                            .trim();
+                });
+        });
+
+        return result;
+    }
+
+    // =========================================================
+    // SCHEDULE SCAN
+    // =========================================================
+
+    function scheduleScan(delay = CONFIG.scanDelay) {
+        clearTimeout(scanTimer);
+
+        scanTimer = setTimeout(
+            function() {
+                const table =
+                    document.querySelector(
+                        CONFIG.tableSelector
+                    );
+
+                if (table !== currentTable) {
+                    bindTableObserver(table);
+                }
+
+                scanTable();
+            },
+            delay
+        );
+    }
+
+    // =========================================================
+    // TABLE OBSERVER
+    // =========================================================
+
+    function bindTableObserver(table) {
+        if (tableObserver) {
+            tableObserver.disconnect();
+            tableObserver = null;
+        }
+
+        currentTable = table || null;
+        lastSignature = '';
+
+        if (!table) {
+            inventoryData = [];
+            render();
+            return;
+        }
+
+        tableObserver =
+            new MutationObserver(
+                function(mutations) {
+                    let relevant = false;
+
+                    for (const mutation of mutations) {
+                        if (
+                            mutation.type ===
+                                'childList' ||
+                            mutation.type ===
+                                'characterData'
+                        ) {
+                            relevant = true;
+                            break;
+                        }
+                    }
+
+                    if (relevant) {
+                        scheduleScan(120);
+                    }
+                }
+            );
+
+        tableObserver.observe(
+            table,
+            {
+                childList: true,
+                subtree: true,
+                characterData: true
+            }
+        );
+    }
+
+    // =========================================================
+    // GLOBAL WATCHER
+    // =========================================================
+
+    function installGlobalWatcher() {
+        if (bodyObserver) {
+            bodyObserver.disconnect();
+        }
+
+        /*
+         * BODY observer:
+         * menangkap table yang diganti/re-render.
+         */
+        bodyObserver =
+            new MutationObserver(
+                function(mutations) {
+                    let relevant = false;
+
+                    for (const mutation of mutations) {
+                        const target =
+                            mutation.target instanceof Element
+                                ? mutation.target
+                                : mutation.target.parentElement;
+
+                        /*
+                         * Abaikan perubahan dari panel sendiri.
+                         */
+                        if (
+                            target &&
+                            target.closest &&
+                            target.closest(
+                                `#${CONFIG.panelId}`
+                            )
+                        ) {
+                            continue;
+                        }
+
+                        if (
+                            mutation.type ===
+                                'childList' ||
+                            mutation.type ===
+                                'characterData'
+                        ) {
+                            relevant = true;
+                            break;
+                        }
+                    }
+
+                    if (!relevant) return;
+
+                    const table =
+                        document.querySelector(
+                            CONFIG.tableSelector
+                        );
+
+                    if (table !== currentTable) {
+                        bindTableObserver(table);
+                        scheduleScan(50);
+                        return;
+                    }
+
+                    scheduleScan(120);
+                }
+            );
+
+        bodyObserver.observe(
+            document.body,
+            {
+                childList: true,
+                subtree: true,
+                characterData: true
+            }
+        );
+
+        /*
+         * Search/filter CRM.
+         */
+        document.addEventListener(
+            'input',
+            function(event) {
+                if (
+                    event.target &&
+                    event.target.closest &&
+                    event.target.closest(
+                        `#${CONFIG.panelId}`
+                    )
+                ) {
+                    return;
+                }
+
+                scheduleScan(100);
+            },
+            true
+        );
+
+        document.addEventListener(
+            'change',
+            function(event) {
+                if (
+                    event.target &&
+                    event.target.closest &&
+                    event.target.closest(
+                        `#${CONFIG.panelId}`
+                    )
+                ) {
+                    return;
+                }
+
+                scheduleScan(100);
+            },
+            true
+        );
+
+        /*
+         * Pagination / tab / filter CRM yang hanya berubah
+         * setelah klik.
+         */
+        document.addEventListener(
+            'click',
+            function(event) {
+                if (
+                    event.target &&
+                    event.target.closest &&
+                    event.target.closest(
+                        `#${CONFIG.panelId}`
+                    )
+                ) {
+                    return;
+                }
+
+                scheduleScan(250);
+            },
+            true
+        );
+
+        /*
+         * Keyboard search / pagination.
+         */
+        document.addEventListener(
+            'keyup',
+            function(event) {
+                if (
+                    event.target &&
+                    event.target.closest &&
+                    event.target.closest(
+                        `#${CONFIG.panelId}`
+                    )
+                ) {
+                    return;
+                }
+
+                scheduleScan(250);
+            },
+            true
+        );
+
+        /*
+         * History API untuk CRM SPA.
+         */
+        if (!history.__ebReadyStockPatched) {
+            const originalPushState =
+                history.pushState;
+
+            const originalReplaceState =
+                history.replaceState;
+
+            history.pushState =
+                function() {
+                    const result =
+                        originalPushState.apply(
+                            this,
+                            arguments
+                        );
+
+                    setTimeout(
+                        () => scheduleScan(50),
+                        0
+                    );
+
+                    return result;
+                };
+
+            history.replaceState =
+                function() {
+                    const result =
+                        originalReplaceState.apply(
+                            this,
+                            arguments
+                        );
+
+                    setTimeout(
+                        () => scheduleScan(50),
+                        0
+                    );
+
+                    return result;
+                };
+
+            history.__ebReadyStockPatched =
+                true;
+
+            window.addEventListener(
+                'popstate',
+                () => scheduleScan(50)
+            );
+        }
+
+        /*
+         * Safety watcher:
+         * tetap mengecek setiap 1 detik untuk kasus CRM
+         * mengubah data tanpa mutation event yang terlihat.
+         */
+        clearInterval(tableWatchTimer);
+
+        tableWatchTimer =
+            setInterval(
+                function() {
+                    const table =
+                        document.querySelector(
+                            CONFIG.tableSelector
+                        );
+
+                    if (table !== currentTable) {
+                        bindTableObserver(table);
+                        scheduleScan(0);
+                        return;
+                    }
+
+                    if (!table) {
+                        if (
+                            inventoryData.length
+                        ) {
+                            inventoryData = [];
+                            render();
+                        }
+
+                        return;
+                    }
+
+                    const signature =
+                        getTableSignature(
+                            table
+                        );
+
+                    if (
+                        signature !==
+                        lastSignature
+                    ) {
+                        lastSignature =
+                            signature;
+
+                        scheduleScan(80);
+                    }
+                },
+                1000
+            );
+    }
+
+    // =========================================================
+    // WAIT CRM
+    // =========================================================
+
+    function waitForCRM() {
+        /*
+         * Jangan tunggu #tbInventory.
+         * Panel + API controls harus hidup walaupun CRM table belum render.
+         */
+        start();
+    }
+
+    // =========================================================
+    // START
+    // =========================================================
+
+    function start() {
+        injectCSS();
+        createPanel();
+
+        const table =
+            document.querySelector(
+                CONFIG.tableSelector
+            );
+
+        currentTable = table || null;
+
+        bindTableObserver(table);
+
+        scanTable();
+
+        installGlobalWatcher();
+
+        /*
+         * AJAX/DataTables initial rendering.
+         */
+        setTimeout(
+            () => scanTable(),
+            300
+        );
+
+        setTimeout(
+            () => scanTable(),
+            1000
+        );
+
+        setTimeout(
+            () => scanTable(),
+            2500
+        );
+
+        setTimeout(
+            () => scanTable(),
+            5000
+        );
+    }
+
+    // =========================================================
+    // INIT
+    // =========================================================
+
+    if (
+        document.readyState ===
+        'loading'
+    ) {
+        document.addEventListener(
+            'DOMContentLoaded',
+            waitForCRM,
+            { once: true }
+        );
+    } else {
+        waitForCRM();
+    }
+
+})();
