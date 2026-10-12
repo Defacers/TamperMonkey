@@ -1,0 +1,571 @@
+// ==UserScript==
+// @name         Kredivo Seller - Summary Dates + Table Refresh
+// @namespace    local.kredivo.summarydates
+// @version      5.5.0
+// @description  Filter tanggal responsif untuk summary dan daftar transaksi Kredivo Seller, dengan judul pemasukan mengikuti rentang tanggal.
+// @match        https://seller.kredivo.com/*
+// @run-at       document-start
+// @grant        none
+// ==/UserScript==
+
+(() => {
+  'use strict';
+
+  const APP_HOST = 'merchant-service-production.kredivo.com';
+  const TARGET_PATHS = new Set([
+    '/v1/b2b/transactions/summary',
+    '/v1/transactions/summary',
+    '/v1/b2b/transactions'
+  ]);
+
+  function isTargetPath(pathname) {
+    return TARGET_PATHS.has(pathname) ||
+      /^\/v1\/stores\/\d+\/transactions$/.test(pathname);
+  }
+
+  const STORAGE_KEY = 'kdc-summary-date-settings-v420';
+  const PANEL_ID = 'kdc-inline-panel-v540';
+  const STYLE_ID = 'kdc-inline-style-v540';
+
+  const defaults = {
+    enabled: true,
+    mode: 'auto',
+    startDate: '',
+    endDate: '',
+    minimized: false
+  };
+
+  function readSettings() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+      return {
+        ...defaults,
+        ...saved,
+        enabled: true,
+        mode: saved.mode === 'manual' ? 'manual' : 'auto'
+      };
+    } catch (_) {
+      return { ...defaults };
+    }
+  }
+
+  let settings = readSettings();
+  let changedCount = 0;
+  let lastRoute = location.href;
+  let observer = null;
+  let mountQueued = false;
+  let incomeTitleObserver = null;
+  let incomeTitleUpdateQueued = false;
+
+  function saveSettings() {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+    } catch (error) {
+      console.warn('[Kredivo Date Bar] Gagal menyimpan pengaturan:', error);
+    }
+  }
+
+  function localDateString(date = new Date()) {
+    const y = date.getFullYear();
+    const m = String(date.getMonth() + 1).padStart(2, '0');
+    const d = String(date.getDate()).padStart(2, '0');
+    return `${y}-${m}-${d}`;
+  }
+
+  function validDate(value) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value || '')) return false;
+    const date = new Date(`${value}T00:00:00`);
+    return !Number.isNaN(date.getTime()) && localDateString(date) === value;
+  }
+
+  // Satu bulan kalender sebelum tanggal akhir, kemudian +1 hari.
+  function automaticStart(endValue) {
+    if (!validDate(endValue)) return '';
+
+    const [year, month, day] = endValue.split('-').map(Number);
+    const previousMonthLastDay = new Date(year, month - 1, 0).getDate();
+    const clampedDay = Math.min(day, previousMonthLastDay);
+    const result = new Date(year, month - 2, clampedDay);
+    result.setDate(result.getDate() + 1);
+
+    return localDateString(result);
+  }
+
+  function effectiveDates() {
+    if (settings.mode === 'auto') {
+      const end = localDateString();
+      return { start: automaticStart(end), end };
+    }
+
+    return { start: settings.startDate, end: settings.endDate };
+  }
+
+  // Ubah judul statistik sesuai jumlah hari kalender yang dipilih.
+  function updateIncomeTitle() {
+    const { start, end } = effectiveDates();
+    if (!validDate(start) || !validDate(end) || start > end) return;
+
+    const [sy, sm, sd] = start.split('-').map(Number);
+    const [ey, em, ed] = end.split('-').map(Number);
+    const startUTC = Date.UTC(sy, sm - 1, sd);
+    const endUTC = Date.UTC(ey, em - 1, ed);
+    const totalDays = Math.floor((endUTC - startUTC) / 86400000) + 1;
+    if (totalDays < 1) return;
+
+    document.querySelectorAll('.ant-statistic-title').forEach(title => {
+      const currentText = (title.textContent || '').replace(/\s+/g, ' ').trim();
+
+      if (!title.dataset.kdcOriginalIncomeTitle &&
+          /^Pemasukan\s+.*Hari Terakhir$/i.test(currentText)) {
+        title.dataset.kdcOriginalIncomeTitle = currentText;
+      }
+
+      const original = title.dataset.kdcOriginalIncomeTitle;
+      if (!original || !/^Pemasukan\s+.*Hari Terakhir$/i.test(original)) return;
+
+      const newTitle = `Pemasukan ${totalDays} Hari Terakhir`;
+      if (currentText !== newTitle) title.textContent = newTitle;
+    });
+  }
+
+  function scheduleIncomeTitleUpdate() {
+    if (incomeTitleUpdateQueued) return;
+    incomeTitleUpdateQueued = true;
+    queueMicrotask(() => {
+      incomeTitleUpdateQueued = false;
+      updateIncomeTitle();
+    });
+  }
+
+  // Intersepsi request fetch dan XHR.
+  function shouldRewrite(rawUrl) {
+    try {
+      const url = new URL(rawUrl, location.href);
+      return url.hostname === APP_HOST && isTargetPath(url.pathname);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function rewriteUrl(rawUrl) {
+    try {
+      const url = new URL(rawUrl, location.href);
+      if (!settings.enabled || url.hostname !== APP_HOST || !isTargetPath(url.pathname)) {
+        return rawUrl;
+      }
+
+      const { start, end } = effectiveDates();
+      if (validDate(start)) url.searchParams.set('start_date', start);
+      if (validDate(end)) url.searchParams.set('end_date', end);
+
+      changedCount += 1;
+      updateStatus();
+      return url.toString();
+    } catch (error) {
+      console.warn('[Kredivo Date Bar] Gagal mengubah URL:', error);
+      return rawUrl;
+    }
+  }
+
+  const nativeFetch = window.fetch;
+  window.fetch = function(input, init) {
+    try {
+      if (typeof input === 'string' || input instanceof URL) {
+        const rawUrl = String(input);
+        if (shouldRewrite(rawUrl)) input = rewriteUrl(rawUrl);
+      } else if (input instanceof Request && shouldRewrite(input.url)) {
+        input = new Request(rewriteUrl(input.url), input);
+      }
+    } catch (error) {
+      console.warn('[Kredivo Date Bar] Fetch hook:', error);
+    }
+    return nativeFetch.call(this, input, init);
+  };
+
+  const nativeXhrOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+    let nextUrl = url;
+    try {
+      if ((typeof url === 'string' || url instanceof URL) && shouldRewrite(String(url))) {
+        nextUrl = rewriteUrl(String(url));
+      }
+    } catch (error) {
+      console.warn('[Kredivo Date Bar] XHR hook:', error);
+    }
+    return nativeXhrOpen.call(this, method, nextUrl, ...rest);
+  };
+
+  // CSS panel INLINE. Jangan gunakan position: fixed.
+  function injectStyle() {
+    if (document.getElementById(STYLE_ID)) return;
+    const style = document.createElement('style');
+    style.id = STYLE_ID;
+    style.textContent = `
+      #${PANEL_ID}, #${PANEL_ID} * { box-sizing: border-box; }
+      #${PANEL_ID} {
+        display:block; position:relative; width:100%; max-width:100%; min-width:0;
+        margin:0 0 16px; color:#172033; background:#fff; border:1px solid #e1e7ef;
+        border-radius:9px; box-shadow:0 2px 9px rgba(22,34,52,.045);
+        font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;
+        overflow:hidden; z-index:1;
+      }
+      #${PANEL_ID} button, #${PANEL_ID} input { font:inherit; }
+      #${PANEL_ID} button { cursor:pointer; }
+      #${PANEL_ID} .kdc-head {
+        display:flex; align-items:center; justify-content:space-between; gap:10px;
+        padding:9px 12px; background:#fafbfd; border-bottom:1px solid #edf0f5;
+      }
+      #${PANEL_ID} .kdc-heading { display:flex; flex-direction:column; min-width:0; }
+      #${PANEL_ID} .kdc-title { font-size:13px; font-weight:700; color:#253247; }
+      #${PANEL_ID} .kdc-subtitle { margin-top:2px; font-size:10px; color:#8490a2; }
+      #${PANEL_ID} .kdc-min {
+        flex:0 0 auto; padding:5px 9px; border:1px solid #dbe2eb; border-radius:6px;
+        background:#fff; color:#475569;
+      }
+      #${PANEL_ID} .kdc-body { display:grid; gap:10px; padding:11px 12px; min-width:0; }
+      #${PANEL_ID} .kdc-row {
+        display:flex; align-items:end; flex-wrap:wrap; gap:9px 12px; min-width:0;
+      }
+      #${PANEL_ID} .kdc-date {
+        display:flex; align-items:center; flex:1 1 180px; min-width:0; gap:7px;
+      }
+      #${PANEL_ID} .kdc-label { flex:0 0 auto; color:#64748b; font-size:11px; white-space:nowrap; }
+      #${PANEL_ID} input[type="date"] {
+        display:block; width:100%; min-width:0; height:32px; padding:4px 7px;
+        border:1px solid #dbe2eb; border-radius:6px; background:#fff; color:#253247;
+      }
+      #${PANEL_ID} input[type="date"]:focus {
+        outline:2px solid rgba(22,119,255,.15); border-color:#1677ff;
+      }
+      #${PANEL_ID} input[type="date"]:disabled { background:#f1f4f7; color:#8892a2; }
+      #${PANEL_ID} .kdc-segment {
+        display:inline-flex; flex:0 0 auto; align-items:center; gap:3px; padding:3px;
+        border-radius:7px; background:#eef2f7;
+      }
+      #${PANEL_ID} .kdc-segment button {
+        min-height:27px; padding:4px 10px; border:1px solid transparent; border-radius:5px;
+        background:transparent; color:#64748b; white-space:nowrap;
+      }
+      #${PANEL_ID} .kdc-segment button.active {
+        color:#172033; background:#fff; border-color:#dbe2eb;
+      }
+      #${PANEL_ID} .kdc-fetch {
+        flex:0 0 auto; min-height:32px; padding:6px 12px; border:1px solid #176bdb;
+        border-radius:6px; background:#176bdb; color:#fff; font-weight:650; white-space:nowrap;
+      }
+      #${PANEL_ID} .kdc-fetch:hover { background:#0958b8; }
+      #${PANEL_ID} .kdc-fetch:disabled { opacity:.65; cursor:wait; }
+      #${PANEL_ID} .kdc-status {
+        display:flex; flex-wrap:wrap; gap:5px 12px; align-items:center;
+        color:#64748b; font-size:10px; overflow-wrap:anywhere;
+      }
+      #${PANEL_ID} .kdc-dot {
+        display:inline-block; width:7px; height:7px; margin-right:5px;
+        border-radius:50%; background:#168653;
+      }
+      #${PANEL_ID} .kdc-message {
+        display:none; padding-top:7px; border-top:1px solid #edf0f5;
+        color:#64748b; font-size:11px; overflow-wrap:anywhere;
+      }
+      #${PANEL_ID} .kdc-message[data-show="true"] { display:block; }
+      #${PANEL_ID}.kdc-minimized .kdc-body { display:none; }
+      @media (max-width:560px) {
+        #${PANEL_ID} .kdc-row { align-items:stretch; }
+        #${PANEL_ID} .kdc-date { flex:1 1 100%; }
+        #${PANEL_ID} .kdc-segment { flex:1 1 auto; }
+        #${PANEL_ID} .kdc-segment button { flex:1 1 50%; }
+        #${PANEL_ID} .kdc-fetch { flex:1 1 100%; }
+      }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  function panelMarkup() {
+    return `
+      <div class="kdc-head">
+        <div class="kdc-heading">
+          <div class="kdc-title">Filter Tanggal Transaksi</div>
+          <div class="kdc-subtitle">Tanggal tersimpan otomatis</div>
+        </div>
+        <button class="kdc-min" data-action="minimize" type="button">${settings.minimized ? 'Buka' : 'Minimalkan'}</button>
+      </div>
+      <div class="kdc-body">
+        <div class="kdc-row">
+          <div class="kdc-date">
+            <label class="kdc-label" for="${PANEL_ID}-start">Awal</label>
+            <input id="${PANEL_ID}-start" type="date" data-start>
+          </div>
+          <div class="kdc-date">
+            <label class="kdc-label" for="${PANEL_ID}-end">Akhir</label>
+            <input id="${PANEL_ID}-end" type="date" data-end>
+          </div>
+          <div class="kdc-segment" aria-label="Mode tanggal">
+            <button type="button" data-mode="manual">Manual</button>
+            <button type="button" data-mode="auto">Otomatis</button>
+          </div>
+          <button class="kdc-fetch" type="button" data-action="fetch">Ambil Data</button>
+        </div>
+        <div class="kdc-status">
+          <span><i class="kdc-dot"></i><span data-status>Siap</span></span>
+          <span data-count>Request diubah: 0</span>
+          <span data-dates></span>
+        </div>
+        <div class="kdc-message" data-message data-show="false" role="status"></div>
+      </div>
+    `;
+  }
+
+  function updateStatus(message) {
+    const panel = document.getElementById(PANEL_ID);
+    if (!panel) return;
+    const dates = effectiveDates();
+    const status = panel.querySelector('[data-status]');
+    const count = panel.querySelector('[data-count]');
+    const dateText = panel.querySelector('[data-dates]');
+    if (status) status.textContent = message ||
+      (settings.mode === 'auto' ? 'Mode otomatis' : 'Mode manual');
+    if (count) count.textContent = `Request diubah: ${changedCount}`;
+    if (dateText) dateText.textContent = `Aktif: ${dates.start || '—'} s/d ${dates.end || '—'}`;
+  }
+
+  function showMessage(message) {
+    const panel = document.getElementById(PANEL_ID);
+    if (!panel) return;
+    const element = panel.querySelector('[data-message]');
+    if (!element) return;
+    element.textContent = message;
+    element.dataset.show = 'true';
+  }
+
+  function syncPanel() {
+    const panel = document.getElementById(PANEL_ID);
+    if (!panel) {
+      scheduleIncomeTitleUpdate();
+      return;
+    }
+    const dates = effectiveDates();
+    const start = panel.querySelector('[data-start]');
+    const end = panel.querySelector('[data-end]');
+    start.value = settings.mode === 'auto' ? dates.start : settings.startDate;
+    end.value = settings.mode === 'auto' ? dates.end : settings.endDate;
+    start.disabled = settings.mode === 'auto';
+    end.disabled = settings.mode === 'auto';
+
+    panel.querySelectorAll('[data-mode]').forEach(button => {
+      button.classList.toggle('active', button.dataset.mode === settings.mode);
+    });
+    panel.classList.toggle('kdc-minimized', settings.minimized);
+    const minimizeButton = panel.querySelector('[data-action="minimize"]');
+    if (minimizeButton) minimizeButton.textContent = settings.minimized ? 'Buka' : 'Minimalkan';
+
+    updateStatus();
+    scheduleIncomeTitleUpdate();
+  }
+
+  function setMode(mode) {
+    if (mode !== 'manual' && mode !== 'auto') return;
+    if (mode === 'manual') {
+      const dates = effectiveDates();
+      settings.startDate = validDate(dates.start) ? dates.start : localDateString();
+      settings.endDate = validDate(dates.end) ? dates.end : localDateString();
+    }
+    settings.mode = mode;
+    saveSettings();
+    syncPanel();
+  }
+
+  function bindPanel(panel) {
+    const start = panel.querySelector('[data-start]');
+    const end = panel.querySelector('[data-end]');
+
+    start.addEventListener('change', () => {
+      settings.mode = 'manual';
+      settings.startDate = start.value;
+      saveSettings();
+      syncPanel();
+      showMessage('Tanggal awal tersimpan.');
+    });
+
+    end.addEventListener('change', () => {
+      settings.mode = 'manual';
+      settings.endDate = end.value;
+      saveSettings();
+      syncPanel();
+      showMessage('Tanggal akhir tersimpan.');
+    });
+
+    panel.querySelectorAll('[data-mode]').forEach(button => {
+      button.addEventListener('click', () => {
+        setMode(button.dataset.mode);
+        showMessage(settings.mode === 'auto' ? 'Mode otomatis aktif.' : 'Mode manual aktif.');
+      });
+    });
+
+    panel.querySelector('[data-action="minimize"]').addEventListener('click', () => {
+      settings.minimized = !settings.minimized;
+      saveSettings();
+      syncPanel();
+    });
+
+    panel.querySelector('[data-action="fetch"]').addEventListener('click', event => {
+      handleFetch(event.currentTarget);
+    });
+
+    syncPanel();
+  }
+
+  // Pemasangan panel inline berdasarkan struktur halaman, bukan floating.
+  function findInsertionPoint() {
+    const candidates = [
+      '#root main.ant-layout-content',
+      '#root .ant-layout-content',
+      'main.ant-layout-content',
+      '.ant-layout-content',
+      '#root main',
+      'main'
+    ];
+
+    for (const selector of candidates) {
+      const element = document.querySelector(selector);
+      if (element && !element.closest('.ant-layout-header') && !element.closest('header')) {
+        const contentCard = element.querySelector('.content.filter-content');
+        if (contentCard && contentCard.parentElement === element) {
+          return { parent: element, before: contentCard };
+        }
+        return { parent: element, before: element.firstElementChild };
+      }
+    }
+
+    const card = document.querySelector('.content.filter-content');
+    if (card && card.parentElement) return { parent: card.parentElement, before: card };
+    return null;
+  }
+
+  function mountPanel() {
+    if (!document.body) return;
+    injectStyle();
+    const point = findInsertionPoint();
+    if (!point) return;
+
+    let panel = document.getElementById(PANEL_ID);
+    if (!panel) {
+      panel = document.createElement('section');
+      panel.id = PANEL_ID;
+      panel.innerHTML = panelMarkup();
+      point.parent.insertBefore(panel, point.before || null);
+      bindPanel(panel);
+      return;
+    }
+
+    const alreadyCorrect = panel.parentElement === point.parent &&
+      (point.before
+        ? panel.nextElementSibling === point.before
+        : panel === point.parent.lastElementChild);
+
+    if (!alreadyCorrect) point.parent.insertBefore(panel, point.before || null);
+  }
+
+  function scheduleMount() {
+    if (mountQueued) return;
+    mountQueued = true;
+    queueMicrotask(() => {
+      mountQueued = false;
+      mountPanel();
+    });
+  }
+
+  function isHistoryPage() {
+    return /\/history(?:\/|$)/i.test(location.pathname);
+  }
+
+  function findHistoryLink() {
+    return Array.from(document.querySelectorAll('a[href]')).find(link => {
+      const text = (link.innerText || link.textContent || '')
+        .replace(/\s+/g, ' ').trim().toLowerCase();
+      return text.includes('lihat riwayat transaksi');
+    });
+  }
+
+  function handleFetch(button) {
+    const dates = effectiveDates();
+    if (!validDate(dates.start) || !validDate(dates.end)) {
+      showMessage('Pilih tanggal awal dan akhir yang valid.');
+      return;
+    }
+    if (dates.start > dates.end) {
+      showMessage('Tanggal awal tidak boleh melewati tanggal akhir.');
+      return;
+    }
+
+    saveSettings();
+    if (!isHistoryPage()) {
+      const historyLink = findHistoryLink();
+      if (historyLink) {
+        showMessage('Tanggal tersimpan. Membuka halaman riwayat…');
+        historyLink.click();
+        return;
+      }
+      showMessage('Tanggal tersimpan. Buka halaman riwayat transaksi terlebih dahulu.');
+      return;
+    }
+
+    button.disabled = true;
+    button.textContent = 'Memuat…';
+    showMessage(`Memuat ulang halaman dengan tanggal ${dates.start} s/d ${dates.end}…`);
+    location.reload();
+  }
+
+  function watchRoute() {
+    if (location.href === lastRoute) return;
+    lastRoute = location.href;
+    scheduleMount();
+    scheduleIncomeTitleUpdate();
+  }
+
+  const originalPushState = history.pushState;
+  history.pushState = function(...args) {
+    const result = originalPushState.apply(this, args);
+    scheduleMount();
+    watchRoute();
+    return result;
+  };
+
+  const originalReplaceState = history.replaceState;
+  history.replaceState = function(...args) {
+    const result = originalReplaceState.apply(this, args);
+    scheduleMount();
+    watchRoute();
+    return result;
+  };
+
+  window.addEventListener('popstate', () => {
+    watchRoute();
+    scheduleMount();
+    scheduleIncomeTitleUpdate();
+  });
+
+  function boot() {
+    injectStyle();
+    mountPanel();
+
+    if (observer) observer.disconnect();
+    observer = new MutationObserver(() => {
+      if (!document.getElementById(PANEL_ID)) scheduleMount();
+      else watchRoute();
+      scheduleIncomeTitleUpdate();
+    });
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+
+    if (incomeTitleObserver) incomeTitleObserver.disconnect();
+    incomeTitleObserver = new MutationObserver(scheduleIncomeTitleUpdate);
+    incomeTitleObserver.observe(document.documentElement, { childList: true, subtree: true });
+
+    scheduleIncomeTitleUpdate();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot, { once: true });
+  } else {
+    boot();
+  }
+})();
