@@ -25,6 +25,7 @@
     let currentView = 'sku';
     let currentSearch = '';
     let currentTheme = 'dark';
+    let excludeHighStock = true;
 
     let tableObserver = null;
     let bodyObserver = null;
@@ -89,7 +90,7 @@
 
         .eb-ready-header {
             display: grid;
-            grid-template-columns: max-content max-content minmax(180px, 1fr) 36px 36px 36px;
+            grid-template-columns: max-content max-content minmax(120px, 1fr) 36px 36px 36px 36px;
             align-items: center;
             gap: 10px;
             padding: 10px 15px;
@@ -174,6 +175,30 @@
 
         .eb-ready-btn:hover {
             background: rgba(255,255,255,.16);
+        }
+
+        .eb-ready-btn.eb-exclude-toggle {
+            width: 36px;
+            min-width: 36px;
+            padding: 0;
+            flex: 0 0 36px;
+            border: 1px solid rgba(255,255,255,.14);
+        }
+
+        .eb-ready-btn.eb-exclude-toggle svg {
+            width: 18px;
+            height: 18px;
+            fill: none;
+            stroke: currentColor;
+            stroke-width: 1.8;
+            stroke-linecap: round;
+            stroke-linejoin: round;
+        }
+
+        .eb-ready-btn.eb-exclude-toggle.active {
+            background: rgba(245, 158, 11, .20);
+            color: #fbbf24;
+            border-color: rgba(245, 158, 11, .45);
         }
 
         .eb-ready-view-switch {
@@ -348,21 +373,27 @@
         }
 
         #${CONFIG.panelId}.eb-view-store .eb-ready-list {
-            display: flex;
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
             gap: 8px;
-            max-height: ${CONFIG.storeMaxHeight}px;
-            overflow-x: auto;
+            max-height: ${CONFIG.skuMaxHeight}px;
+            overflow-x: hidden;
             overflow-y: auto;
-            align-items: flex-start;
+            align-items: stretch;
+            align-content: start;
         }
 
         .eb-store-group {
             min-width: 0;
-            flex: 0 0 270px;
+            width: 100%;
+            height: 100%;
+            box-sizing: border-box;
             padding: 11px;
             border-radius: 11px;
             background: rgba(255,255,255,.065);
             border: 1px solid rgba(255,255,255,.08);
+            display: flex;
+            flex-direction: column;
         }
 
         .eb-store-header {
@@ -376,12 +407,14 @@
 
         .eb-store-name {
             min-width: 0;
-            overflow: hidden;
+            max-width: 100%;
+            overflow-wrap: anywhere;
+            word-break: normal;
+            white-space: normal;
             color: #fff;
             font-size: 11px;
+            line-height: 1.35;
             font-weight: 800;
-            white-space: nowrap;
-            text-overflow: ellipsis;
             cursor: pointer;
         }
 
@@ -391,9 +424,9 @@
 
         .eb-store-products {
             margin-top: 7px;
-            max-height: 250px;
-            overflow-y: auto;
-            overflow-x: hidden;
+            flex: 1 1 auto;
+            min-height: 0;
+            overflow: visible;
         }
 
         .eb-store-product {
@@ -417,11 +450,13 @@
         }
 
         .eb-store-product-name {
-            overflow: hidden;
+            min-width: 0;
             color: rgba(255,255,255,.75);
             font-size: 9px;
-            white-space: nowrap;
-            text-overflow: ellipsis;
+            line-height: 1.35;
+            white-space: normal;
+            overflow-wrap: anywhere;
+            word-break: normal;
         }
 
         .eb-store-product-sku {
@@ -460,7 +495,7 @@
 
         @media(max-width:900px) {
             .eb-ready-header {
-                grid-template-columns: max-content max-content minmax(0, 1fr) 36px 36px 36px;
+                grid-template-columns: max-content max-content minmax(120px, 1fr) 36px 36px 36px 36px;
                 gap: 8px;
             }
 
@@ -555,11 +590,68 @@
             vertical-align: middle;
         }
 
-        #ebReadyStockPanel select.eb-api-input {
-            appearance: auto;
-            -webkit-appearance: auto;
-            padding-left: 10px;
-            padding-right: 8px;
+        /* Status select remains the source of truth for existing request logic; its visual
+           control is a custom dropdown so options match Province / Store / Category exactly. */
+        #ebReadyStockPanel #ebApiStatus.eb-api-input {
+            display: none !important;
+        }
+        #ebReadyStockPanel #ebApiStatusField .eb-api-trigger {
+            font-family: inherit !important;
+            font-size: 11px !important;
+            font-weight: 600 !important;
+            color: #f8fafc !important;
+            background-color: #202936 !important;
+            border-color: rgba(255,255,255,.13) !important;
+        }
+        #ebReadyStockPanel #ebApiStatusField .eb-api-menu {
+            min-width: 100% !important;
+            width: max(100%, 190px) !important;
+            max-height: none !important;
+            padding: 5px !important;
+        }
+        #ebReadyStockPanel #ebApiStatusField .eb-api-options {
+            max-height: none !important;
+            padding: 0 !important;
+        }
+        #ebReadyStockPanel #ebApiStatusField .eb-api-option {
+            display: block !important;
+            width: 100% !important;
+            min-height: 30px !important;
+            padding: 8px 10px !important;
+            box-sizing: border-box !important;
+            color: rgba(255,255,255,.86) !important;
+            background: transparent !important;
+            font-family: inherit !important;
+            font-size: 11px !important;
+            font-weight: 500 !important;
+            line-height: 14px !important;
+            white-space: nowrap !important;
+            cursor: pointer !important;
+            border-radius: 6px !important;
+        }
+        #ebReadyStockPanel #ebApiStatusField .eb-api-option:hover,
+        #ebReadyStockPanel #ebApiStatusField .eb-api-option.selected {
+            color: #ffffff !important;
+            background: rgba(255,255,255,.10) !important;
+        }
+        #ebReadyStockPanel.eb-theme-light #ebApiStatusField .eb-api-trigger {
+            color: #172033 !important;
+            background-color: #ffffff !important;
+            border-color: #cbd5e1 !important;
+        }
+        #ebReadyStockPanel.eb-theme-light #ebApiStatusField .eb-api-menu {
+            background: #ffffff !important;
+            border-color: #cbd5e1 !important;
+            box-shadow: 0 15px 40px rgba(15,23,42,.16) !important;
+        }
+        #ebReadyStockPanel.eb-theme-light #ebApiStatusField .eb-api-option {
+            color: #334155 !important;
+            background: transparent !important;
+        }
+        #ebReadyStockPanel.eb-theme-light #ebApiStatusField .eb-api-option:hover,
+        #ebReadyStockPanel.eb-theme-light #ebApiStatusField .eb-api-option.selected {
+            color: #0f172a !important;
+            background: #e8eef6 !important;
         }
 
         #ebReadyStockPanel .eb-api-trigger {
@@ -833,6 +925,8 @@
             color: #172033 !important;
         }
         #ebReadyStockPanel.eb-theme-light .eb-ready-btn:hover { background: #d8e2ef !important; }
+        #ebReadyStockPanel.eb-theme-light .eb-ready-btn.eb-exclude-toggle { border-color: #cbd5e1 !important; }
+        #ebReadyStockPanel.eb-theme-light .eb-ready-btn.eb-exclude-toggle.active { background: #fef3c7 !important; color: #92400e !important; border-color: #f59e0b !important; }
         #ebReadyStockPanel.eb-theme-light .eb-ready-view-switch {
             background: #e8eef6 !important;
             border-color: #d4deea !important;
@@ -1122,7 +1216,7 @@
                     cell.textContent
                 );
 
-                if (stock >= CONFIG.excludeStockAtOrAbove) {
+                if (excludeHighStock && stock >= CONFIG.excludeStockAtOrAbove) {
                     hasExcludedStock = true;
                     return;
                 }
@@ -1156,7 +1250,7 @@
 
             if (
                 displayedTotal > 0 &&
-                displayedTotal < CONFIG.excludeStockAtOrAbove &&
+                (!excludeHighStock || displayedTotal < CONFIG.excludeStockAtOrAbove) &&
                 totalStock === 0
             ) {
                 totalStock = displayedTotal;
@@ -1167,9 +1261,9 @@
             );
 
             if (
-                !hasExcludedStock &&
+                (!excludeHighStock || !hasExcludedStock) &&
                 totalStock >= CONFIG.minStock &&
-                totalStock < CONFIG.excludeStockAtOrAbove
+                (!excludeHighStock || totalStock < CONFIG.excludeStockAtOrAbove)
             ) {
                 row.classList.add(
                     'eb-ready-row'
@@ -2439,6 +2533,22 @@
         });
     }
 
+function applyExcludeToggle() {
+        const panel = document.getElementById(CONFIG.panelId);
+        if (!panel) return;
+        const button = panel.querySelector('#ebReadyExcludeToggle');
+        if (!button) return;
+        button.classList.toggle('active', excludeHighStock);
+        button.innerHTML = excludeHighStock
+            ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3l18 18"/><path d="M10.6 10.6a2 2 0 0 0 2.8 2.8"/><path d="M9.9 5.2A10.8 10.8 0 0 1 12 5c5 0 8.5 4.5 9.5 7-.4 1-1.2 2.2-2.3 3.3"/><path d="M6.2 6.2C3.9 7.7 2.7 9.8 2.5 12c.5 1.3 3.9 7 9.5 7 1 0 2-.2 2.8-.5"/></svg>'
+            : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12S6 5 12 5s9.5 7 9.5 7-3.5 7-9.5 7-9.5-7-9.5-7Z"/><circle cx="12" cy="12" r="3"/></svg>';
+        button.title = excludeHighStock
+            ? 'Exclude aktif: stok ≥ 9.999 disembunyikan. Klik untuk Include.'
+            : 'Include aktif: stok ≥ 9.999 ditampilkan. Klik untuk Exclude.';
+        button.setAttribute('aria-label', button.title);
+        button.setAttribute('aria-pressed', String(excludeHighStock));
+    }
+
 function applyTheme() {
         const panel = document.getElementById(CONFIG.panelId);
         if (!panel) return;
@@ -2474,17 +2584,25 @@ function applyTheme() {
                        placeholder="Filter hasil: SKU / barang / toko, pisahkan dengan koma..."
                        autocomplete="off">
 
+                <button type="button" class="eb-ready-btn eb-exclude-toggle" id="ebReadyExcludeToggle" title="Aktif/nonaktifkan pengecualian stok ≥ 9.999" aria-label="Exclude stok ≥ 9.999"> </button>
                 <button type="button" class="eb-ready-btn" id="ebReadyTheme" title="Ganti mode terang/gelap" aria-label="Ganti mode terang/gelap">☀️</button>
                 <button type="button" class="eb-ready-btn" id="ebReadyRefresh" title="Scan table">↻</button>
                 <button type="button" class="eb-ready-btn" id="ebReadyCollapse" title="Minimize">−</button>
             </div>
 
             <div class="eb-api-bar" id="ebApiBar">
-                <div class="eb-api-field">
+                <div class="eb-api-field" id="ebApiStatusField">
                     <select id="ebApiStatus" class="eb-api-input" aria-label="Status">
                         <option value="1" selected>New</option>
                         <option value="8">New (Discounted)</option>
                     </select>
+                    <button type="button" class="eb-api-trigger" id="ebApiStatusTrigger" aria-haspopup="listbox" aria-expanded="false">New</button>
+                    <div class="eb-api-menu" role="listbox" aria-label="Pilih status">
+                        <div class="eb-api-options" id="ebApiStatusOptions">
+                            <div class="eb-api-option selected" role="option" tabindex="0" data-value="1" aria-selected="true">New</div>
+                            <div class="eb-api-option" role="option" tabindex="0" data-value="8" aria-selected="false">New (Discounted)</div>
+                        </div>
+                    </div>
                 </div>
 
                 <div class="eb-api-field" id="ebApiProvinceField">
@@ -2549,6 +2667,18 @@ function applyTheme() {
             currentTheme = localStorage.getItem('ebInventoryTheme') === 'light' ? 'light' : 'dark';
         } catch (e) {}
         applyTheme();
+
+        try {
+            excludeHighStock = localStorage.getItem('ebInventoryExcludeHighStock') !== 'false';
+        } catch (e) { excludeHighStock = true; }
+        applyExcludeToggle();
+
+        panel.querySelector('#ebReadyExcludeToggle').addEventListener('click', function () {
+            excludeHighStock = !excludeHighStock;
+            try { localStorage.setItem('ebInventoryExcludeHighStock', String(excludeHighStock)); } catch (e) {}
+            applyExcludeToggle();
+            scanTable();
+        });
 
         panel.querySelector('#ebReadyTheme').addEventListener('click', function () {
             currentTheme = currentTheme === 'dark' ? 'light' : 'dark';
@@ -2629,7 +2759,60 @@ function applyTheme() {
             }
         });
 
-        panel.querySelector('#ebApiStatus').addEventListener('change', function () {
+        const statusSelect = panel.querySelector('#ebApiStatus');
+        const statusField = panel.querySelector('#ebApiStatusField');
+        const statusTrigger = panel.querySelector('#ebApiStatusTrigger');
+        const statusOptions = panel.querySelector('#ebApiStatusOptions');
+
+        function syncStatusDropdown() {
+            const selectedOption = statusSelect.options[statusSelect.selectedIndex];
+            statusTrigger.textContent = selectedOption ? selectedOption.text : 'Pilih status';
+            statusOptions.querySelectorAll('.eb-api-option').forEach(option => {
+                const selected = option.dataset.value === statusSelect.value;
+                option.classList.toggle('selected', selected);
+                option.setAttribute('aria-selected', selected ? 'true' : 'false');
+            });
+        }
+
+        statusTrigger.addEventListener('click', function (event) {
+            event.preventDefault();
+            event.stopPropagation();
+            panel.querySelectorAll('.eb-api-field.open').forEach(other => {
+                if (other !== statusField) other.classList.remove('open');
+            });
+            const willOpen = !statusField.classList.contains('open');
+            statusField.classList.toggle('open', willOpen);
+            statusTrigger.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+        });
+
+        statusOptions.querySelectorAll('.eb-api-option').forEach(option => {
+            function chooseStatus() {
+                statusSelect.value = option.dataset.value;
+                syncStatusDropdown();
+                statusField.classList.remove('open');
+                statusTrigger.setAttribute('aria-expanded', 'false');
+                statusSelect.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+            option.addEventListener('click', event => {
+                event.preventDefault();
+                event.stopPropagation();
+                chooseStatus();
+            });
+            option.addEventListener('keydown', event => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    chooseStatus();
+                } else if (event.key === 'Escape') {
+                    statusField.classList.remove('open');
+                    statusTrigger.setAttribute('aria-expanded', 'false');
+                    statusTrigger.focus();
+                }
+            });
+        });
+        syncStatusDropdown();
+
+        statusSelect.addEventListener('change', function () {
+            syncStatusDropdown();
             setApiStatus('Status diubah ke ' + this.options[this.selectedIndex].text + '. Tekan SEARCH untuk request.', false);
         });
 
@@ -2637,6 +2820,8 @@ function applyTheme() {
             if (!event.target.closest('#' + CONFIG.panelId + ' .eb-api-field')) {
                 panel.querySelectorAll('.eb-api-field.open').forEach(field => {
                     field.classList.remove('open');
+                    const trigger = field.querySelector('.eb-api-trigger');
+                    if (trigger) trigger.setAttribute('aria-expanded', 'false');
                 });
             }
         }, true);
@@ -4050,8 +4235,20 @@ function applyTheme() {
                     grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)) !important;
                 }
                 #ebReadyStockPanel.eb-view-store .eb-ready-list {
-                    display: flex !important;
-                    align-items: flex-start !important;
+                    display: grid !important;
+                    grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)) !important;
+                    align-items: stretch !important;
+                    align-content: start !important;
+                    overflow-x: hidden !important;
+                }
+                #ebReadyStockPanel.eb-view-store .eb-store-group {
+                    width: 100% !important;
+                    height: 100% !important;
+                    box-sizing: border-box !important;
+                }
+                #ebReadyStockPanel.eb-view-store .eb-store-products {
+                    max-height: none !important;
+                    overflow: visible !important;
                 }
                 #ebReadyStockPanel.eb-collapsed .eb-ready-list {
                     display: none !important;
