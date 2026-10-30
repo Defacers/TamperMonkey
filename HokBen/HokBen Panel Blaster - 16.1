@@ -1,0 +1,328 @@
+// ==UserScript==
+// @name         HokBen Panel Blaster Clean Version + Show All
+// @namespace    http://tampermonkey.net/
+// @version      16.1
+// @description  Panel kontrol fresh UI dengan payload Dine In & Take Away terbaru, serta membuka semua pertanyaan sekaligus.
+// @author       You
+// @match        https://update.hokben.co.id/
+// @match        https://update.hokben.co.id/*
+// @match        https://update.hokben.co.id/survey/*
+// @grant        none
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // CSS Injection: Membuka semua fieldset agar langsung tampil ke bawah sekaligus tanpa efek step-by-step
+    const styleFix = document.createElement('style');
+    styleFix.innerHTML = `
+        fieldset {
+            display: block !important;
+            opacity: 1 !important;
+            position: relative !important;
+            width: 100% !important;
+            margin-bottom: 20px !important;
+            box-shadow: none !important;
+            background: #ffffff !important;
+            border: 1px solid #e0e0e0 !important;
+            border-radius: 8px !important;
+            padding: 20px !important;
+        }
+        /* Sembunyikan tombol next/previous bawaan template wizard */
+        fieldset input.action-button:not([type="submit"]) {
+            display: none !important;
+        }
+    `;
+    document.head.appendChild(styleFix);
+
+    // Payload Dine In (Exam 2) - Disesuaikan dengan fetch terbaru (questionId-96: 301)
+    const payloadDineIn = {
+        "examId": "2",
+        "valid": "1",
+        "questionId-3": "8",
+        "questionId-4": "14",
+        "questionId-5": "19",
+        "questionId-6": "23",
+        "questionId-7": "29",
+        "questionId-8": "39",
+        "questionId-9": "44",
+        "questionId-10": "48",
+        "questionId-11": "53",
+        "questionId-12": "58",
+        "questionId-13": "62",
+        "questionId-14": "66",
+        "questionId-15": "72",
+        "questionId-16": "77",
+        "questionId-17": "82",
+        "questionId-84": "226",
+        "questionId-89": "243",
+        "questionId-91": "257",
+        "questionId-104": "293",
+        "questionId-105": "297",
+        "questionId-18": "88",
+        "questionId-95": "266",
+        "questionId-96": "301",
+        "questionId-99": "279",
+        "questionId-106": "310",
+        "questionId-107": "330",
+        "questionId-108": "336",
+        "questionId-19": "92",
+        "questionId-20": "96"
+    };
+
+    // Payload Take Away (Exam 3)
+    const payloadTakeAway = {
+        "examId": "3",
+        "valid": "1",
+        "questionId-57": "198",
+        "questionId-58": "204",
+        "questionId-59": "156",
+        "questionId-60": "161",
+        "questionId-61": "167",
+        "questionId-62": "98",
+        "questionId-63": "103",
+        "questionId-64": "107",
+        "questionId-65": "112",
+        "questionId-66": "117",
+        "questionId-67": "121",
+        "questionId-68": "125",
+        "questionId-69": "131",
+        "questionId-70": "136",
+        "questionId-71": "141",
+        "questionId-85": "228",
+        "questionId-90": "249",
+        "questionId-92": "263",
+        "questionId-102": "285",
+        "questionId-103": "289",
+        "questionId-97": "273",
+        "questionId-98": "307",
+        "questionId-100": "282",
+        "questionId-109": "337",
+        "questionId-110": "357",
+        "questionId-111": "363",
+        "questionId-72": "146",
+        "questionId-73": "150",
+        "questionId-74": "154"
+    };
+
+    const isMainPage = window.location.pathname === '/' || window.location.pathname === '';
+    if (!isMainPage) return;
+
+    window.addEventListener('load', () => {
+        buildPanelAndRelocateSearch();
+    });
+
+    function buildPanelAndRelocateSearch() {
+        const containerBox = document.querySelector('.container[style*="margin-top"]') || document.querySelector('.container');
+        if (!containerBox) return;
+
+        const originalSearchWrapper = document.getElementById('custom-search-input');
+        if (!originalSearchWrapper) return;
+
+        containerBox.innerHTML = '';
+
+        const panelHTML = `
+            <div style="
+                max-width: 720px;
+                margin: 40px auto;
+                background: #ffffff;
+                border: 1px solid #e0e0e0;
+                border-radius: 16px;
+                padding: 30px;
+                box-shadow: 0 15px 35px rgba(0,0,0,0.1);
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            ">
+                <div style="text-align: center; margin-bottom: 25px;">
+                    <h2 style="color: #c0392b; font-weight: 700; font-size: 22px; margin-bottom: 5px;">⚡ HokBen Automated Survey Blaster</h2>
+                    <p style="color: #7f8c8d; font-size: 13px; margin: 0;">Panel Kontrol Fresh UI (All Questions Visible)</p>
+                </div>
+
+                <div style="margin-bottom: 20px;">
+                    <label style="font-size: 12px; font-weight: 600; color: #2c3e50; display: block; margin-bottom: 6px;">PILIH STORE</label>
+                    <div id="search-mount-point" style="width: 100%;"></div>
+                </div>
+
+                <div style="display: flex; gap: 15px; margin-bottom: 20px;">
+                    <div style="flex: 1;">
+                        <label style="font-size: 12px; font-weight: 600; color: #2c3e50; display: block; margin-bottom: 6px;">JENIS LAYANAN</label>
+                        <select id="blaster-type" style="width: 100%; padding: 12px; border-radius: 8px; border: 1px solid #cbd5e1; font-size: 13px; background: #fff; outline: none;">
+                            <option value="2">Dine In (Exam 2)</option>
+                            <option value="3">Take Away (Exam 3)</option>
+                        </select>
+                    </div>
+                    <div style="flex: 1;">
+                        <label style="font-size: 12px; font-weight: 600; color: #2c3e50; display: block; margin-bottom: 6px;">JUMLAH TARGET</label>
+                        <input id="blaster-target" type="number" value="10" min="1" style="width: 100%; padding: 11px; border-radius: 8px; border: 1px solid #cbd5e1; font-size: 13px; box-sizing: border-box; outline: none;">
+                    </div>
+                </div>
+
+                <button id="blaster-action-btn" style="
+                    width: 100%; background: linear-gradient(135deg, #e74c3c, #c0392b); color: white; border: none; padding: 14px;
+                    border-radius: 8px; font-weight: bold; font-size: 14px; cursor: pointer; box-shadow: 0 4px 15px rgba(231,76,60,0.3);
+                    transition: all 0.2s ease;
+                ">MULAI TEMBAK SURVEY</button>
+
+                <!-- Terminal Log Utama -->
+                <div style="margin-top: 25px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
+                        <label style="font-size: 11px; font-weight: bold; color: #64748b;">🖥️ LIVE EXECUTION LOG (UI):</label>
+                        <button id="clear-log-btn" style="background: transparent; border: none; color: #ef4444; font-size: 10px; cursor: pointer; font-weight: bold;">[Clear Log]</button>
+                    </div>
+                    <div id="blaster-log-box" style="
+                        background: #0f172a; color: #e2e8f0; font-family: 'Courier New', Courier, monospace; font-size: 11px;
+                        padding: 12px; border-radius: 8px; height: 160px; overflow-y: auto; border: 1px solid #334155;
+                        box-shadow: inset 0 2px 6px rgba(0,0,0,0.5); line-height: 1.4;
+                    ">
+                        <div style="color: #64748b;">// Sistem siap.</div>
+                    </div>
+                </div>
+            </div>
+        `;
+
+        containerBox.innerHTML = panelHTML;
+
+        const mountPoint = document.getElementById('search-mount-point');
+        if (mountPoint && originalSearchWrapper) {
+            originalSearchWrapper.className = "";
+            originalSearchWrapper.style.width = "100%";
+
+            const inputField = originalSearchWrapper.querySelector('input#search');
+            if (inputField) {
+                inputField.style.width = "100%";
+                inputField.style.padding = "12px 15px";
+                inputField.style.borderRadius = "8px";
+                inputField.style.border = "1px solid #cbd5e1";
+                inputField.style.boxSizing = "border-box";
+            }
+
+            mountPoint.appendChild(originalSearchWrapper);
+        }
+
+        document.getElementById('clear-log-btn').onclick = function() {
+            document.getElementById('blaster-log-box').innerHTML = '<div style="color: #64748b;">// Log dibersihkan.</div>';
+        };
+
+        document.getElementById('blaster-action-btn').onclick = async function() {
+            const storeVal = document.getElementById('store').value;
+            if (!storeVal) {
+                alert("Harap pilih store terlebih dahulu dari kotak pencarian store!");
+                return;
+            }
+
+            const surveyType = document.getElementById('blaster-type').value;
+            const targetCount = parseInt(document.getElementById('blaster-target').value, 10);
+            const actionBtn = document.getElementById('blaster-action-btn');
+
+            actionBtn.disabled = true;
+            actionBtn.style.background = '#94a3b8';
+            actionBtn.innerText = "SEDANG MENEMBAK SURVEY...";
+
+            const SURVEY_PAGE_URL = `https://update.hokben.co.id/survey/${surveyType}?&kdstore=${storeVal}&valid=0`;
+            const SUBMIT_URL = "https://update.hokben.co.id/result";
+            const payload = (surveyType === '3') ? payloadTakeAway : payloadDineIn;
+
+            let previousToken = "";
+
+            for (let i = 1; i <= targetCount; i++) {
+                logExecution(`=== SIKLUS #${i} / ${targetCount} ===`, "#facc15", "info");
+
+                let success = false;
+                let attempts = 0;
+                const maxAttempts = 5;
+
+                while (!success && attempts < maxAttempts) {
+                    attempts++;
+                    try {
+                        const pageRes = await fetch(SURVEY_PAGE_URL, {
+                            method: "GET",
+                            credentials: "include",
+                            cache: "no-store"
+                        });
+
+                        const htmlText = await pageRes.text();
+
+                        const rawSetCookie = pageRes.headers.get("set-cookie") || "";
+                        let sessionVal = "HttpOnly (Aktif)";
+                        const sessionMatch = rawSetCookie.match(/laravel_session=([^;]+)/);
+                        if (sessionMatch && sessionMatch[1]) {
+                            sessionVal = sessionMatch[1];
+                        }
+
+                        const tokenMatch = htmlText.match(/name="_token"\s+value="([^"]+)"/);
+                        if (!tokenMatch || !tokenMatch[1]) {
+                            logExecution(`[Percobaan ${attempts}] Token CSRF tidak ditemukan, retry...`, "#f87171", "warn");
+                            await new Promise(r => setTimeout(r, 800));
+                            continue;
+                        }
+                        const currentToken = tokenMatch[1];
+
+                        if (attempts === 1 && previousToken !== "" && currentToken === previousToken) {
+                            logExecution(`[Checker] Token sama terdeteksi, me-refresh sesi...`, "#fbbf24", "warn");
+                            await new Promise(r => setTimeout(r, 1000));
+                            continue;
+                        }
+
+                        logExecution(`[GET] Sesi: ${sessionVal.substring(0, 20)}... | Token: ${currentToken.substring(0, 10)}...`, "#38bdf8", "log");
+
+                        const formData = new URLSearchParams();
+                        formData.append("_token", currentToken);
+                        for (const key in payload) {
+                            formData.append(key, payload[key]);
+                        }
+
+                        const submitRes = await fetch(SUBMIT_URL, {
+                            method: "POST",
+                            headers: {
+                                "Content-Type": "application/x-www-form-urlencoded",
+                                "X-Requested-With": "XMLHttpRequest",
+                                "Referer": SURVEY_PAGE_URL
+                            },
+                            body: formData,
+                            credentials: "include"
+                        });
+
+                        const submitText = await submitRes.text();
+
+                        if (submitRes.ok) {
+                            logExecution(`[POST SUKSES] Survey #${i} terkirim! [HTTP ${submitRes.status}]`, "#4ade80", "success");
+                            previousToken = currentToken;
+                            success = true;
+                        } else {
+                            logExecution(`[POST GAGAL] HTTP Status: ${submitRes.status} - Res: ${submitText.substring(0, 100)}`, "#f87171", "error");
+                        }
+
+                    } catch (err) {
+                        logExecution(`[ERROR Percobaan ${attempts}] ${err.message}`, "#f87171", "error");
+                        await new Promise(r => setTimeout(r, 1000));
+                    }
+                }
+
+                await new Promise(resolve => setTimeout(resolve, 1500));
+            }
+
+            logExecution(`=== SEMUA TARGET ${targetCount} SURVEY SELESAI DIPROSES ===`, "#4ade80", "info");
+            actionBtn.disabled = false;
+            actionBtn.style.background = 'linear-gradient(135deg, #e74c3c, #c0392b)';
+            actionBtn.innerText = "MULAI TEMBAK SURVEY";
+            alert(`Selesai! Berhasil mengirim total ${targetCount} survey.`);
+        };
+    }
+
+    function logExecution(text, color = "#38bdf8", type = "log") {
+        const time = new Date().toLocaleTimeString();
+
+        const logBox = document.getElementById('blaster-log-box');
+        if (logBox) {
+            logBox.innerHTML += `<div style="color: ${color}; margin-bottom: 2px;"><span style="color: #64748b;">[${time}]</span> ${text}</div>`;
+            logBox.scrollTop = logBox.scrollHeight;
+        }
+
+        const consoleMsg = `[HokBen Blaster Execution ${time}] ${text}`;
+        if (type === "warn") console.warn(consoleMsg);
+        else if (type === "error") console.error(consoleMsg);
+        else if (type === "success") console.log(`%c${consoleMsg}`, "color: #2ecc71; font-weight: bold;");
+        else if (type === "info") console.log(`%c${consoleMsg}`, "color: #f1c40f; font-weight: bold;");
+        else console.log(consoleMsg);
+    }
+
+})();
