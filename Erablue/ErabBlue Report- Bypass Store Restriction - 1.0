@@ -1,0 +1,139 @@
+// ==UserScript==
+// @name         ErabBlue Store Auto-Override (early intercept)
+// @namespace    http://tampermonkey.net/
+// @version      1.0
+// @description  Override SearchStoreArea saat auto-fetch di page load
+// @match        https://report.erablue.id/*
+// @grant        unsafeWindow
+// @run-at       document-start
+// ==/UserScript==
+
+(function () {
+    'use strict';
+    const TAG = '[ErabBlue Early]';
+    const TARGET = '/Home/SearchStoreArea';
+
+    // Strategi yang dipakai untuk request auto-fetch pertama
+    // Ubah sesuai kebutuhan:
+    const OVERRIDE_BODY = {
+        isPermission: false,      // ← coba matikan filter izin
+        permissionValue: null,
+        isActive: null,           // ← null = semua status (aktif + nonaktif)
+        companyids: '',
+        companybrandids: '',
+        areaids: ''
+    };
+
+    console.log(TAG, 'Script jalan di document-start. Memasang intercept...');
+
+    // === 1. Intercept fetch ===
+    const origFetch = unsafeWindow.fetch;
+    if (origFetch) {
+        unsafeWindow.fetch = function (input, init) {
+            const url = typeof input === 'string' ? input : (input && input.url) || '';
+            if (url.indexOf(TARGET) !== -1) {
+                console.log(TAG, '[fetch] Request ke', TARGET);
+                console.log(TAG, '[fetch] Body asli:', init && init.body);
+
+                try {
+                    const body = JSON.parse(init.body);
+                    console.log(TAG, '[fetch] Body asli (obj):', body);
+
+                    // Override semua field
+                    Object.assign(body, OVERRIDE_BODY);
+                    init.body = JSON.stringify(body);
+                    console.log(TAG, '[fetch] Body diubah:', init.body);
+                } catch (e) {
+                    console.warn(TAG, '[fetch] Gagal parse body:', e);
+                }
+
+                return origFetch.call(this, input, init).then(resp => {
+                    const clone = resp.clone();
+                    clone.json().then(data => {
+                        const n = Array.isArray(data) ? data.length
+                            : (data && Array.isArray(data.data) ? data.data.length : '?');
+                        console.log(TAG, `[fetch] Response: ${n} toko`);
+                    }).catch(() => {});
+                    return resp;
+                });
+            }
+            return origFetch.call(this, input, init);
+        };
+        console.log(TAG, 'fetch intercept terpasang.');
+    }
+
+    // === 2. Intercept XMLHttpRequest (kalau Angular/jQuery pakai XHR) ===
+    const OrigXHR = unsafeWindow.XMLHttpRequest;
+    if (OrigXHR) {
+        const origOpen = OrigXHR.prototype.open;
+        const origSend = OrigXHR.prototype.send;
+
+        OrigXHR.prototype.open = function (method, url) {
+            this._eb_url = url;
+            return origOpen.apply(this, arguments);
+        };
+
+        OrigXHR.prototype.send = function (body) {
+            if (this._eb_url && this._eb_url.indexOf(TARGET) !== -1) {
+                console.log(TAG, '[xhr] Request ke', TARGET);
+                console.log(TAG, '[xhr] Body asli:', body);
+                try {
+                    const obj = JSON.parse(body);
+                    console.log(TAG, '[xhr] Body asli (obj):', obj);
+                    Object.assign(obj, OVERRIDE_BODY);
+                    body = JSON.stringify(obj);
+                    console.log(TAG, '[xhr] Body diubah:', body);
+                } catch (e) {
+                    console.warn(TAG, '[xhr] Gagal parse body:', e);
+                }
+
+                // Log response
+                this.addEventListener('load', function () {
+                    try {
+                        const data = JSON.parse(this.responseText);
+                        const n = Array.isArray(data) ? data.length
+                            : (data && Array.isArray(data.data) ? data.data.length : '?');
+                        console.log(TAG, `[xhr] Response: ${n} toko`);
+                    } catch (e) {}
+                });
+            }
+            return origSend.call(this, body);
+        };
+        console.log(TAG, 'XHR intercept terpasang.');
+    }
+
+    // === 3. Fallback: intercept jQuery.ajax (kalau jQuery dipakai) ===
+    // jQuery mungkin belum ada di document-start, jadi tunggu sebentar
+    const waitJQ = setInterval(() => {
+        const jq = unsafeWindow.jQuery || unsafeWindow.$;
+        if (jq && jq.ajax && !jq._eb_patched) {
+            const origAjax = jq.ajax;
+            jq.ajax = function (url, options) {
+                let opts = url;
+                if (typeof url === 'string') {
+                    opts = options || {};
+                    opts.url = url;
+                }
+                if (opts && opts.url && opts.url.indexOf(TARGET) !== -1) {
+                    console.log(TAG, '[jq] Request ke', TARGET, 'data:', opts.data);
+                    try {
+                        let data = opts.data;
+                        if (typeof data === 'string') data = JSON.parse(data);
+                        Object.assign(data, OVERRIDE_BODY);
+                        opts.data = JSON.stringify(data);
+                        console.log(TAG, '[jq] Data diubah:', opts.data);
+                    } catch (e) {
+                        console.warn(TAG, '[jq] Gagal parse data:', e);
+                    }
+                }
+                return origAjax.call(this, opts);
+            };
+            jq._eb_patched = true;
+            console.log(TAG, 'jQuery.ajax intercept terpasang.');
+            clearInterval(waitJQ);
+        }
+    }, 50);
+    setTimeout(() => clearInterval(waitJQ), 10000);
+
+    console.log(TAG, 'Semua intercept terpasang. Menunggu request auto-fetch...');
+})();
