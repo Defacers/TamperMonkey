@@ -1,0 +1,1856 @@
+// ==UserScript==
+// @name         Chess.com Multi-Line Hint (v1.9.1 Auto-Detect Side)
+// @namespace    http://tampermonkey.net/
+// @version      1.9.1
+// @description  Multi-line chess hints + weighted auto-move + human jitter + auto-detect player color + polished responsive UI.
+// @author       You
+// @match        https://www.chess.com/play/*
+// @match        https://www.chess.com/game/*
+// @match        https://www.chess.com/analysis*
+// @require      https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.12.1/chess.min.js
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // ==================== CONFIG ====================
+    const STORAGE_KEY = 'chessBestMoveState';
+    const PANEL_POS_KEY = 'chessPanelPos';
+    const SETTINGS_KEY = 'chessPanelSettings';
+    const PANEL_COLLAPSED_KEY = 'chessPanelCollapsed';
+    const DEBOUNCE_MS = 600;
+    const OBSERVE_ROOT_SELECTOR = 'wc-simple-move-list';
+    const BOARD_SELECTOR = 'wc-chess-board';
+    const DEPTH = 14;
+    const MULTIPV = 5;
+
+    const IS_ANALYSIS = /\/analysis/.test(location.pathname);
+    const ALLOW_AUTO_OUTSIDE_ANALYSIS_KEY = 'chessAllowAutoOutsideAnalysis';
+
+    function isAutoOutsideAnalysisAllowed() {
+        return localStorage.getItem(ALLOW_AUTO_OUTSIDE_ANALYSIS_KEY) === '1';
+    }
+    function setAutoOutsideAnalysisAllowed(v) {
+        if (v) localStorage.setItem(ALLOW_AUTO_OUTSIDE_ANALYSIS_KEY, '1');
+        else localStorage.removeItem(ALLOW_AUTO_OUTSIDE_ANALYSIS_KEY);
+    }
+
+    // ==================== SETTINGS ====================
+    const DEFAULT_SETTINGS = {
+        bestColor: '#7fa650',
+        colorExcellent: '#4fa3d1',
+        colorGood: '#5cb85c',
+        colorInaccuracy: '#e6c84a',
+        colorMistake: '#e67e22',
+        colorBlunder: '#d9534f',
+
+        bestLineWidth: 10,
+        bestCircleRadius: 12,
+        bestOpacity: 0.95,
+        multiLineWidth: 6,
+        multiLineOpacity: 0.7,
+        multiCircleRadius: 8,
+
+        showExcellent: true,
+        showGood: true,
+        showInaccuracy: true,
+        showMistake: true,
+        showBlunder: true,
+        showBest: true,
+
+        thresholdExcellent: 0.3,
+        thresholdGood: 0.8,
+        thresholdInaccuracy: 1.5,
+        thresholdMistake: 3.0,
+
+        autoMoveDelay: 400,
+        autoMoveHumanize: true,
+        autoMoveMode: 'drag',
+
+        autoMoveStrategy: 'weighted',
+        autoMoveWeightPower: 2.5,
+        autoMoveMinWinrate: 0.30,
+        autoMoveTopN: 5,
+        autoMoveExcludeBlunder: true,
+        autoMoveExcludeMistake: false,
+
+        jitterScale: 0.35,
+        reactionTimeMin: 200,
+        reactionTimeMax: 900,
+    };
+
+    let SETTINGS = { ...DEFAULT_SETTINGS };
+    function loadSettings() {
+        try {
+            const raw = localStorage.getItem(SETTINGS_KEY);
+            if (!raw) return;
+            const s = JSON.parse(raw);
+            if (s && typeof s === 'object') SETTINGS = { ...DEFAULT_SETTINGS, ...s };
+        } catch (e) {}
+    }
+    function saveSettings() {
+        try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(SETTINGS)); } catch (e) {}
+    }
+    loadSettings();
+
+    // ==================== AUTO-DETECT PLAYER COLOR ====================
+    const USER_OVERRIDE_KEY = 'cmh-user-override-side';
+    let userOverrideSide = localStorage.getItem(USER_OVERRIDE_KEY) === '1';
+    let detectedSide = null;
+    let detectionAttempts = 0;
+    const MAX_DETECTION_ATTEMPTS = 6;
+
+    function detectPlayerColor() {
+        const board = document.querySelector(BOARD_SELECTOR);
+
+        // Priority 1: game-color attribute (live game)
+        if (board) {
+            const gc = board.getAttribute('game-color');
+            if (gc === 'white' || gc === 'w') return { color: 'w', source: 'game-color' };
+            if (gc === 'black' || gc === 'b') return { color: 'b', source: 'game-color' };
+        }
+
+        // Priority 2: player card component
+        const userEl = document.querySelector('.play-controller-component.user, [data-test-element="user"]');
+        if (userEl) {
+            if (userEl.classList.contains('white')) return { color: 'w', source: 'player-card' };
+            if (userEl.classList.contains('black')) return { color: 'b', source: 'player-card' };
+        }
+
+        // Priority 3: player-color attribute
+        if (board) {
+            const pc = board.getAttribute('player-color');
+            if (pc === 'w' || pc === 'white') return { color: 'w', source: 'player-color' };
+            if (pc === 'b' || pc === 'black') return { color: 'b', source: 'player-color' };
+        }
+
+        // Priority 4: flipped board (play page + analysis page)
+        if (board) {
+            const flipped = board.classList.contains('flipped');
+            return { color: flipped ? 'b' : 'w', source: 'flipped' };
+        }
+
+        return null;
+    }
+
+    function applyDetectedSide(detected) {
+        if (!detected) return;
+        detectedSide = detected.color;
+        const radio = document.querySelector(`input[name="cmh-side"][value="${detected.color}"]`);
+        if (radio) radio.checked = true;
+        updateDetectionBadge(detected);
+    }
+
+    function updateDetectionBadge(detected) {
+        const badge = document.getElementById('cmh-auto-badge');
+        const info = document.getElementById('cmh-detected-info');
+        if (!badge || !info) return;
+
+        if (userOverrideSide) {
+            badge.textContent = 'MANUAL';
+            badge.style.background = 'rgba(255,255,255,0.1)';
+            badge.style.color = '#aaa';
+            info.textContent = 'Manual override active';
+            info.style.color = '#8b8783';
+            return;
+        }
+
+        if (detected) {
+            const colorLabel = detected.color === 'w' ? 'White' : 'Black';
+            const sourceLabel = {
+                'game-color': 'game',
+                'player-card': 'player',
+                'player-color': 'attr',
+                'flipped': 'board',
+                'manual': 'manual',
+            }[detected.source] || detected.source;
+            badge.textContent = 'AUTO ✓';
+            badge.style.background = '#7fa650';
+            badge.style.color = '#fff';
+            info.textContent = `Detected: ${colorLabel} (${sourceLabel})`;
+            info.style.color = '#a8d476';
+        } else {
+            badge.textContent = 'NOT DETECTED';
+            badge.style.background = 'rgba(230,162,60,0.2)';
+            badge.style.color = '#f0b85c';
+            info.textContent = 'Set manually';
+            info.style.color = '#c99456';
+        }
+    }
+
+    function tryDetectSide() {
+        if (userOverrideSide) return;
+        const detected = detectPlayerColor();
+        if (detected) {
+            applyDetectedSide(detected);
+            return;
+        }
+        if (detectionAttempts < MAX_DETECTION_ATTEMPTS) {
+            detectionAttempts++;
+            setTimeout(tryDetectSide, 1000);
+        } else {
+            updateDetectionBadge(null);
+        }
+    }
+
+    function handleManualOverride() {
+        userOverrideSide = true;
+        localStorage.setItem(USER_OVERRIDE_KEY, '1');
+        updateDetectionBadge(detectedSide ? { color: detectedSide, source: 'manual' } : null);
+    }
+
+    function resetAutoDetect() {
+        userOverrideSide = false;
+        localStorage.removeItem(USER_OVERRIDE_KEY);
+        detectionAttempts = 0;
+        tryDetectSide();
+    }
+
+    // ==================== SAN NORMALIZER ====================
+    const FIGURINE_MAP = {
+        '♔': 'K', '♚': 'K', '♕': 'Q', '♛': 'Q',
+        '♖': 'R', '♜': 'R', '♗': 'B', '♝': 'B',
+        '♘': 'N', '♞': 'N'
+    };
+    function normalizeSan(raw) {
+        if (!raw) return '';
+        let s = raw.trim();
+        s = s.replace(/[♔♚♕♛♖♜♗♝♘♞]/g, ch => FIGURINE_MAP[ch] || ch);
+        s = s.replace(/\s+/g, '');
+        s = s.replace(/[!?]+/g, '');
+        s = s.replace(/[+#]/g, '');
+        s = s.replace(/[=\(]?([QRBNqrbn])\)?$/, (m, p) => '=' + p.toUpperCase());
+        s = s.replace(/^0-0-0$/, 'O-O-O').replace(/^0-0$/, 'O-O');
+        return s;
+    }
+    window.__normalizeSan = normalizeSan;
+
+    // ==================== STATE ====================
+    function loadState() {
+        try {
+            const raw = localStorage.getItem(STORAGE_KEY);
+            if (!raw) return null;
+            const s = JSON.parse(raw);
+            if (!s || !Array.isArray(s.moves) || typeof s.fen !== 'string') return null;
+            return s;
+        } catch (e) { return null; }
+    }
+    function saveState(state) {
+        try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch (e) {}
+    }
+    function clearState() { localStorage.removeItem(STORAGE_KEY); }
+
+    // ==================== STYLE INJECTION ====================
+    function injectStyles() {
+        if (document.getElementById('cmh-styles')) return;
+        const style = document.createElement('style');
+        style.id = 'cmh-styles';
+        style.textContent = `
+            #cmh-panel {
+                position: fixed; top: 12px; left: 12px; z-index: 99999;
+                background: linear-gradient(180deg, #2a2825 0%, #232120 100%);
+                color: #e3e1de;
+                border-radius: 12px;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, sans-serif;
+                font-size: clamp(11px, 1.15vw, 13px);
+                box-shadow: 0 8px 32px rgba(0,0,0,0.55), 0 0 0 1px rgba(255,255,255,0.06);
+                width: clamp(280px, 92vw, 360px);
+                max-width: 96vw;
+                max-height: min(88vh, 800px);
+                display: flex; flex-direction: column;
+                user-select: none;
+                box-sizing: border-box;
+                overflow: hidden;
+                backdrop-filter: blur(6px);
+                -webkit-backdrop-filter: blur(6px);
+            }
+            #cmh-panel * { box-sizing: border-box; }
+
+            .cmh-header {
+                cursor: move;
+                padding: 12px 14px;
+                background: linear-gradient(180deg, #2f2d29 0%, #252321 100%);
+                border-bottom: 1px solid #3a3835;
+                display: flex; justify-content: space-between; align-items: center;
+                touch-action: none;
+                min-height: 44px;
+                flex-shrink: 0;
+            }
+            .cmh-header-title {
+                font-weight: 700; color: #fff;
+                font-size: clamp(12px, 1.3vw, 14px);
+                letter-spacing: 0.3px;
+                display: flex; align-items: center; gap: 8px;
+                pointer-events: none;
+            }
+            .cmh-header-title::before {
+                content: '';
+                display: inline-block;
+                width: 8px; height: 8px;
+                border-radius: 50%;
+                background: #7fa650;
+                box-shadow: 0 0 8px #7fa650;
+                animation: cmh-pulse 2s ease-in-out infinite;
+            }
+            @keyframes cmh-pulse {
+                0%, 100% { opacity: 1; }
+                50% { opacity: 0.4; }
+            }
+            .cmh-header-actions { display: flex; gap: 4px; align-items: center; }
+            .cmh-icon-btn {
+                background: rgba(255,255,255,0.05);
+                border: none;
+                color: #aaa;
+                padding: 6px;
+                border-radius: 6px;
+                cursor: pointer;
+                display: inline-flex; align-items: center; justify-content: center;
+                min-width: 32px; min-height: 32px;
+                touch-action: manipulation;
+                transition: background 0.15s, color 0.15s;
+            }
+            .cmh-icon-btn:hover { background: rgba(255,255,255,0.12); color: #fff; }
+            .cmh-icon-btn:active { transform: scale(0.95); }
+
+            .cmh-body {
+                padding: 12px 14px;
+                overflow-y: auto;
+                flex: 1;
+                -webkit-overflow-scrolling: touch;
+                display: flex; flex-direction: column; gap: 10px;
+            }
+            .cmh-body::-webkit-scrollbar { width: 8px; }
+            .cmh-body::-webkit-scrollbar-track { background: transparent; }
+            .cmh-body::-webkit-scrollbar-thumb { background: #3a3835; border-radius: 4px; }
+            .cmh-body::-webkit-scrollbar-thumb:hover { background: #4a4845; }
+
+            .cmh-section {
+                background: rgba(255,255,255,0.025);
+                border: 1px solid rgba(255,255,255,0.04);
+                border-radius: 8px;
+                padding: 10px 12px;
+            }
+            .cmh-section-title {
+                font-size: 11px;
+                font-weight: 700;
+                color: #8b8783;
+                text-transform: uppercase;
+                letter-spacing: 0.8px;
+                margin-bottom: 8px;
+                display: flex; align-items: center; gap: 6px;
+            }
+            .cmh-section-title svg { width: 14px; height: 14px; opacity: 0.7; }
+
+            .cmh-row {
+                display: flex; align-items: center; gap: 10px;
+                min-height: 34px;
+                padding: 3px 0;
+            }
+            .cmh-row-between { justify-content: space-between; }
+            .cmh-label {
+                display: flex; align-items: center; gap: 8px;
+                cursor: pointer;
+                flex: 1;
+                color: #cfccc7;
+                font-size: clamp(11px, 1.1vw, 12.5px);
+                min-width: 0;
+            }
+            .cmh-label input[type="radio"],
+            .cmh-label input[type="checkbox"] {
+                width: 16px; height: 16px;
+                flex-shrink: 0;
+                accent-color: #7fa650;
+                cursor: pointer;
+            }
+            .cmh-value {
+                font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+                font-size: 11px;
+                color: #a8a49f;
+                background: rgba(0,0,0,0.25);
+                padding: 2px 8px;
+                border-radius: 4px;
+                min-width: 44px;
+                text-align: center;
+                font-variant-numeric: tabular-nums;
+            }
+            .cmh-range {
+                -webkit-appearance: none;
+                appearance: none;
+                width: 100%;
+                height: 4px;
+                border-radius: 2px;
+                background: #3a3835;
+                outline: none;
+                cursor: pointer;
+                margin: 0;
+            }
+            .cmh-range::-webkit-slider-thumb {
+                -webkit-appearance: none;
+                appearance: none;
+                width: 16px; height: 16px;
+                border-radius: 50%;
+                background: #7fa650;
+                border: 2px solid #2a2825;
+                cursor: pointer;
+                box-shadow: 0 0 0 1px rgba(127,166,80,0.3);
+                transition: transform 0.15s;
+            }
+            .cmh-range::-webkit-slider-thumb:hover { transform: scale(1.15); }
+            .cmh-range::-moz-range-thumb {
+                width: 16px; height: 16px;
+                border-radius: 50%;
+                background: #7fa650;
+                border: 2px solid #2a2825;
+                cursor: pointer;
+            }
+
+            .cmh-select {
+                width: 100%;
+                background: #1a1917;
+                color: #e3e1de;
+                border: 1px solid #3a3835;
+                border-radius: 6px;
+                padding: 8px 10px;
+                font-size: 12px;
+                cursor: pointer;
+                min-height: 36px;
+                outline: none;
+                transition: border-color 0.15s;
+            }
+            .cmh-select:focus { border-color: #7fa650; }
+
+            .cmh-color-input {
+                width: 36px; height: 26px;
+                padding: 0;
+                border: 2px solid rgba(255,255,255,0.1);
+                border-radius: 5px;
+                background: none;
+                cursor: pointer;
+                flex-shrink: 0;
+            }
+
+            .cmh-btn {
+                background: linear-gradient(180deg, #88b35c 0%, #6f9545 100%);
+                color: #fff;
+                border: none;
+                padding: 10px 14px;
+                border-radius: 8px;
+                cursor: pointer;
+                font-weight: 600;
+                font-size: 13px;
+                width: 100%;
+                min-height: 42px;
+                touch-action: manipulation;
+                transition: transform 0.1s, box-shadow 0.15s, filter 0.15s;
+                box-shadow: 0 2px 6px rgba(127,166,80,0.3);
+                letter-spacing: 0.3px;
+            }
+            .cmh-btn:hover { filter: brightness(1.08); box-shadow: 0 3px 10px rgba(127,166,80,0.45); }
+            .cmh-btn:active { transform: translateY(1px); }
+            .cmh-btn-secondary {
+                background: rgba(255,255,255,0.06);
+                color: #ccc;
+                box-shadow: none;
+            }
+            .cmh-btn-secondary:hover { background: rgba(255,255,255,0.12); box-shadow: none; }
+            .cmh-btn-danger {
+                background: linear-gradient(180deg, #b35757 0%, #8c3f3f 100%);
+                box-shadow: 0 2px 6px rgba(179,87,87,0.3);
+            }
+            .cmh-btn-danger:hover { box-shadow: 0 3px 10px rgba(179,87,87,0.45); }
+            .cmh-btn-group {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 6px;
+            }
+
+            .cmh-status {
+                padding: 10px 12px;
+                border-radius: 8px;
+                font-size: 12px;
+                background: rgba(127,166,80,0.1);
+                border: 1px solid rgba(127,166,80,0.25);
+                color: #a8d476;
+                display: flex; align-items: center; gap: 8px;
+                word-break: break-word;
+                line-height: 1.4;
+            }
+            .cmh-status.cmh-status-warn {
+                background: rgba(230,162,60,0.12);
+                border-color: rgba(230,162,60,0.3);
+                color: #f0b85c;
+            }
+            .cmh-status.cmh-status-error {
+                background: rgba(217,83,79,0.12);
+                border-color: rgba(217,83,79,0.3);
+                color: #e88f8c;
+            }
+            .cmh-status.cmh-status-loading::before {
+                content: '';
+                width: 12px; height: 12px;
+                border-radius: 50%;
+                border: 2px solid currentColor;
+                border-top-color: transparent;
+                animation: cmh-spin 0.8s linear infinite;
+                flex-shrink: 0;
+            }
+            @keyframes cmh-spin {
+                to { transform: rotate(360deg); }
+            }
+
+            .cmh-move-list {
+                display: flex; flex-direction: column; gap: 5px;
+            }
+            .cmh-move-item {
+                display: flex; align-items: center; gap: 8px;
+                padding: 8px 10px;
+                background: rgba(255,255,255,0.03);
+                border-left: 3px solid #666;
+                border-radius: 6px;
+                font-size: 12px;
+                position: relative;
+                overflow: hidden;
+                transition: background 0.15s;
+            }
+            .cmh-move-item:hover { background: rgba(255,255,255,0.06); }
+            .cmh-move-badge {
+                font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+                font-weight: 700;
+                font-size: 10px;
+                padding: 2px 6px;
+                border-radius: 4px;
+                text-transform: uppercase;
+                letter-spacing: 0.4px;
+                flex-shrink: 0;
+                min-width: 68px;
+                text-align: center;
+                color: #fff;
+            }
+            .cmh-move-uci {
+                font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+                font-weight: 600;
+                color: #e3e1de;
+                flex: 1;
+                font-size: 13px;
+            }
+            .cmh-move-score {
+                font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+                font-size: 11px;
+                color: #a8a49f;
+                font-variant-numeric: tabular-nums;
+                flex-shrink: 0;
+            }
+            .cmh-move-winbar {
+                position: absolute;
+                left: 0; bottom: 0;
+                height: 2px;
+                background: currentColor;
+                opacity: 0.4;
+            }
+
+            .cmh-empty {
+                padding: 20px 12px;
+                text-align: center;
+                color: #7a7671;
+                font-size: 12px;
+                line-height: 1.5;
+            }
+            .cmh-empty svg { width: 36px; height: 36px; opacity: 0.3; margin-bottom: 8px; }
+
+            .cmh-chosen {
+                padding: 10px 12px;
+                background: rgba(230,162,60,0.1);
+                border: 1px solid rgba(230,162,60,0.3);
+                border-radius: 8px;
+                font-size: 12px;
+                color: #f0b85c;
+                display: flex; align-items: center; gap: 8px;
+                word-break: break-word;
+            }
+            .cmh-chosen.hidden { display: none; }
+
+            .cmh-settings {
+                display: none;
+                flex-direction: column;
+                gap: 10px;
+            }
+            .cmh-settings.open { display: flex; }
+
+            .cmh-cat-row {
+                display: flex; align-items: center; gap: 8px;
+                padding: 6px 8px;
+                background: rgba(0,0,0,0.15);
+                border-radius: 6px;
+                min-height: 38px;
+            }
+            .cmh-cat-row input[type="checkbox"] {
+                width: 16px; height: 16px;
+                accent-color: #7fa650;
+                cursor: pointer;
+                flex-shrink: 0;
+            }
+            .cmh-cat-label {
+                flex: 1; font-size: 12px; color: #cfccc7;
+                min-width: 0; overflow: hidden; text-overflow: ellipsis;
+            }
+
+            .cmh-toast {
+                position: fixed;
+                bottom: 24px;
+                left: 50%;
+                transform: translateX(-50%) translateY(100px);
+                background: rgba(30, 28, 26, 0.95);
+                color: #fff;
+                padding: 10px 18px;
+                border-radius: 8px;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                font-size: 13px;
+                box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+                z-index: 999999;
+                opacity: 0;
+                transition: opacity 0.25s, transform 0.25s;
+                pointer-events: none;
+                border: 1px solid rgba(255,255,255,0.1);
+                max-width: 90vw;
+            }
+            .cmh-toast.show {
+                opacity: 1;
+                transform: translateX(-50%) translateY(0);
+            }
+            .cmh-toast.ok { border-color: rgba(127,166,80,0.5); }
+            .cmh-toast.err { border-color: rgba(217,83,79,0.5); }
+
+            .cmh-auto-badge {
+                font-size: 9px; font-weight: 700; letter-spacing: 0.5px;
+                padding: 2px 6px; border-radius: 3px;
+                background: rgba(255,255,255,0.1); color: #aaa;
+                text-transform: uppercase;
+                transition: all 0.2s;
+            }
+            .cmh-detected-info {
+                margin-top: 6px; padding-top: 6px;
+                border-top: 1px solid rgba(255,255,255,0.06);
+                font-size: 10.5px; color: #8b8783;
+                transition: color 0.2s;
+            }
+            .cmh-btn-redetect {
+                margin-top: 8px;
+                background: rgba(255,255,255,0.05);
+                border: 1px solid rgba(255,255,255,0.1);
+                color: #aaa;
+                padding: 6px 10px;
+                border-radius: 5px;
+                font-size: 11px;
+                cursor: pointer;
+                width: 100%;
+                min-height: 30px;
+                touch-action: manipulation;
+                transition: background 0.15s;
+            }
+            .cmh-btn-redetect:hover { background: rgba(255,255,255,0.1); color: #fff; }
+
+            @media (max-width: 480px) {
+                #cmh-panel {
+                    width: calc(100vw - 16px);
+                    max-width: calc(100vw - 16px);
+                    left: 8px !important;
+                    top: 8px !important;
+                    border-radius: 10px;
+                }
+                .cmh-header { padding: 10px 12px; }
+                .cmh-body { padding: 10px 12px; }
+                .cmh-btn-group { grid-template-columns: 1fr; }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+    injectStyles();
+
+    // ==================== PANEL ====================
+    function createPanel() {
+        if (!document.body) { setTimeout(createPanel, 500); return; }
+        if (document.getElementById('cmh-panel')) return;
+
+        const panel = document.createElement('div');
+        panel.id = 'cmh-panel';
+
+        const saved = localStorage.getItem(PANEL_POS_KEY);
+        if (saved) {
+            try {
+                const { x, y } = JSON.parse(saved);
+                panel.style.left = x + 'px';
+                panel.style.top = y + 'px';
+            } catch (e) {}
+        }
+
+        const autoOutsideAllowed = isAutoOutsideAnalysisAllowed();
+        const autoMoveDisabled = !IS_ANALYSIS && !autoOutsideAllowed;
+        const collapsed = localStorage.getItem(PANEL_COLLAPSED_KEY) === '1';
+
+        const iconChevron = (down) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px;"><polyline points="${down ? '6 9 12 15 18 9' : '9 18 15 12 9 6'}"/></svg>`;
+        const iconGear = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:14px;height:14px;"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>`;
+        const iconReset = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:14px;height:14px;"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>`;
+        const iconChart = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>`;
+        const iconArrow = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="19" x2="19" y2="5"/><polyline points="12 5 19 5 19 12"/></svg>`;
+        const iconBot = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="2"/><path d="M12 7v4"/><line x1="8" y1="16" x2="8" y2="16"/><line x1="16" y1="16" x2="16" y2="16"/></svg>`;
+        const iconHuman = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="7" r="4"/><path d="M5.5 21v-2a6.5 6.5 0 0 1 13 0v2"/></svg>`;
+        const iconUser = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="7" r="4"/><path d="M5.5 21v-2a6.5 6.5 0 0 1 13 0v2"/></svg>`;
+        const iconChess = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:36px;height:36px;"><path d="M8 21h8M12 17v4M9 5l1.5 3.5h3L15 5zM7 21v-2a5 5 0 0 1 10 0v2"/></svg>`;
+
+        panel.innerHTML = `
+            <div class="cmh-header" id="cmh-drag-header">
+                <div class="cmh-header-title">Multi-Line Hint</div>
+                <div class="cmh-header-actions">
+                    <button class="cmh-icon-btn" id="cmh-btn-settings" title="Settings">${iconGear}</button>
+                    <button class="cmh-icon-btn" id="cmh-btn-collapse" title="Collapse">${iconChevron(!collapsed)}</button>
+                </div>
+            </div>
+            <div class="cmh-body" id="cmh-body" style="display:${collapsed ? 'none' : 'flex'};">
+
+                <!-- Play as (with auto-detect) -->
+                <div class="cmh-section">
+                    <div class="cmh-section-title" style="justify-content:space-between;">
+                        <span style="display:flex;align-items:center;gap:6px;">${iconUser} Play as</span>
+                        <span id="cmh-auto-badge" class="cmh-auto-badge">DETECTING...</span>
+                    </div>
+                    <div class="cmh-row">
+                        <label class="cmh-label"><input type="radio" name="cmh-side" value="w" checked> White</label>
+                    </div>
+                    <div class="cmh-row">
+                        <label class="cmh-label"><input type="radio" name="cmh-side" value="b"> Black</label>
+                    </div>
+                    <div id="cmh-detected-info" class="cmh-detected-info">Detecting...</div>
+                    <button id="cmh-btn-redetect" class="cmh-btn-redetect">🔄 Re-detect / Enable Auto</button>
+                </div>
+
+                <!-- Actions -->
+                <div class="cmh-section">
+                    <div class="cmh-section-title">${iconArrow} Actions</div>
+                    <div class="cmh-row">
+                        <label class="cmh-label"><input type="checkbox" id="cmh-auto-mode" checked> Auto-analyze</label>
+                    </div>
+                    <div class="cmh-row">
+                        <label class="cmh-label" style="color:${autoMoveDisabled ? '#666' : '#e6a23c'};">
+                            <input type="checkbox" id="cmh-auto-move" ${autoMoveDisabled ? 'disabled' : ''}>
+                            Auto-move ${autoMoveDisabled ? '(analysis only)' : ''}
+                        </label>
+                    </div>
+                    <div class="cmh-row">
+                        <label class="cmh-label" style="color:#c99456;font-size:11px;">
+                            <input type="checkbox" id="cmh-allow-outside" ${autoOutsideAllowed ? 'checked' : ''}>
+                            ⚠ Allow outside analysis
+                        </label>
+                    </div>
+                    <div style="margin-top:8px;">
+                        <button class="cmh-btn" id="cmh-btn-analyze">Analyze Now</button>
+                    </div>
+                    <div class="cmh-btn-group" style="margin-top:6px;">
+                        <button class="cmh-btn cmh-btn-secondary cmh-btn-danger" id="cmh-btn-reset">${iconReset} Reset</button>
+                        <button class="cmh-btn cmh-btn-secondary" id="cmh-btn-settings2">${iconGear} Settings</button>
+                    </div>
+                </div>
+
+                <!-- Status -->
+                <div class="cmh-status" id="cmh-status">Initializing engine...</div>
+
+                <!-- Chosen move info -->
+                <div class="cmh-chosen hidden" id="cmh-chosen"></div>
+
+                <!-- Move list -->
+                <div class="cmh-section" id="cmh-moves-section" style="display:none;">
+                    <div class="cmh-section-title">${iconChart} Candidates</div>
+                    <div class="cmh-move-list" id="cmh-move-list"></div>
+                </div>
+
+                <!-- Empty state -->
+                <div class="cmh-empty" id="cmh-empty">
+                    ${iconChess}
+                    <div>No analysis yet.<br>Click <strong>Analyze Now</strong> to start.</div>
+                </div>
+
+                <!-- Settings -->
+                <div class="cmh-settings" id="cmh-settings">
+
+                    <div class="cmh-section">
+                        <div class="cmh-section-title">${iconArrow} Multi-Line Colors</div>
+                        ${['Best','Excellent','Good','Inaccuracy','Mistake','Blunder'].map(k => {
+                            const key = k === 'Best' ? 'bestColor' : 'color' + k;
+                            const showKey = k === 'Best' ? 'showBest' : 'show' + k;
+                            return `
+                            <div class="cmh-cat-row">
+                                <input type="checkbox" id="cmh-set-${showKey}" ${SETTINGS[showKey] ? 'checked' : ''}>
+                                <span class="cmh-cat-label">${k}</span>
+                                <input type="color" class="cmh-color-input" id="cmh-set-${key}" value="${SETTINGS[key]}">
+                            </div>`;
+                        }).join('')}
+                    </div>
+
+                    <div class="cmh-section">
+                        <div class="cmh-section-title">${iconArrow} Arrow Appearance</div>
+                        <div class="cmh-row cmh-row-between">
+                            <span class="cmh-label" style="cursor:default;">Best Width</span>
+                            <span class="cmh-value" id="cmh-lbl-bestW">${SETTINGS.bestLineWidth}</span>
+                        </div>
+                        <input type="range" class="cmh-range" id="cmh-set-bestW" min="2" max="24" step="1" value="${SETTINGS.bestLineWidth}">
+                        <div class="cmh-row cmh-row-between" style="margin-top:6px;">
+                            <span class="cmh-label" style="cursor:default;">Multi Width</span>
+                            <span class="cmh-value" id="cmh-lbl-multiW">${SETTINGS.multiLineWidth}</span>
+                        </div>
+                        <input type="range" class="cmh-range" id="cmh-set-multiW" min="2" max="20" step="1" value="${SETTINGS.multiLineWidth}">
+                        <div class="cmh-row cmh-row-between" style="margin-top:6px;">
+                            <span class="cmh-label" style="cursor:default;">Multi Opacity</span>
+                            <span class="cmh-value" id="cmh-lbl-multiO">${SETTINGS.multiLineOpacity}</span>
+                        </div>
+                        <input type="range" class="cmh-range" id="cmh-set-multiO" min="0.1" max="1" step="0.05" value="${SETTINGS.multiLineOpacity}">
+                    </div>
+
+                    <div class="cmh-section">
+                        <div class="cmh-section-title">${iconChart} Thresholds (pawns)</div>
+                        ${[
+                            { id: 'Ex', label: 'Excellent ≤', key: 'thresholdExcellent', min: 0.1, max: 1.0, step: 0.05 },
+                            { id: 'Good', label: 'Good ≤', key: 'thresholdGood', min: 0.3, max: 2.0, step: 0.05 },
+                            { id: 'In', label: 'Inaccuracy ≤', key: 'thresholdInaccuracy', min: 0.5, max: 3.0, step: 0.1 },
+                            { id: 'Mis', label: 'Mistake ≤', key: 'thresholdMistake', min: 1.0, max: 6.0, step: 0.1 },
+                        ].map(t => `
+                            <div class="cmh-row cmh-row-between">
+                                <span class="cmh-label" style="cursor:default;font-size:11px;">${t.label}</span>
+                                <span class="cmh-value" id="cmh-lbl-th${t.id}">${SETTINGS[t.key]}</span>
+                            </div>
+                            <input type="range" class="cmh-range" id="cmh-set-th${t.id}" min="${t.min}" max="${t.max}" step="${t.step}" value="${SETTINGS[t.key]}" style="margin-bottom:6px;">
+                        `).join('')}
+                    </div>
+
+                    <div class="cmh-section">
+                        <div class="cmh-section-title">${iconBot} Auto-Move Strategy</div>
+                        <div class="cmh-row">
+                            <span class="cmh-label" style="cursor:default;">Strategy</span>
+                        </div>
+                        <select class="cmh-select" id="cmh-set-strategy">
+                            <option value="best" ${SETTINGS.autoMoveStrategy==='best'?'selected':''}>🎯 Best Only (strongest)</option>
+                            <option value="weighted" ${SETTINGS.autoMoveStrategy==='weighted'?'selected':''}>🎲 Weighted Mix (human-like)</option>
+                            <option value="random" ${SETTINGS.autoMoveStrategy==='random'?'selected':''}>🎰 Random Top-N</option>
+                        </select>
+                        <div class="cmh-row cmh-row-between" style="margin-top:6px;">
+                            <span class="cmh-label" style="cursor:default;font-size:11px;">Weight Power</span>
+                            <span class="cmh-value" id="cmh-lbl-wp">${SETTINGS.autoMoveWeightPower}</span>
+                        </div>
+                        <input type="range" class="cmh-range" id="cmh-set-wp" min="0.5" max="5" step="0.1" value="${SETTINGS.autoMoveWeightPower}">
+                        <div class="cmh-row cmh-row-between" style="margin-top:6px;">
+                            <span class="cmh-label" style="cursor:default;font-size:11px;">Min Winrate</span>
+                            <span class="cmh-value" id="cmh-lbl-minwr">${SETTINGS.autoMoveMinWinrate.toFixed(2)}</span>
+                        </div>
+                        <input type="range" class="cmh-range" id="cmh-set-minwr" min="0.05" max="0.9" step="0.05" value="${SETTINGS.autoMoveMinWinrate}">
+                        <div class="cmh-row cmh-row-between" style="margin-top:6px;">
+                            <span class="cmh-label" style="cursor:default;font-size:11px;">Top-N Candidates</span>
+                            <span class="cmh-value" id="cmh-lbl-topN">${SETTINGS.autoMoveTopN}</span>
+                        </div>
+                        <input type="range" class="cmh-range" id="cmh-set-topN" min="1" max="5" step="1" value="${SETTINGS.autoMoveTopN}">
+                        <div class="cmh-row" style="margin-top:6px;">
+                            <label class="cmh-label" style="font-size:11px;"><input type="checkbox" id="cmh-set-excludeBlunder" ${SETTINGS.autoMoveExcludeBlunder?'checked':''}> Never play Blunder</label>
+                        </div>
+                        <div class="cmh-row">
+                            <label class="cmh-label" style="font-size:11px;"><input type="checkbox" id="cmh-set-excludeMistake" ${SETTINGS.autoMoveExcludeMistake?'checked':''}> Never play Mistake</label>
+                        </div>
+                    </div>
+
+                    <div class="cmh-section">
+                        <div class="cmh-section-title">${iconHuman} Human Simulation</div>
+                        <div class="cmh-row">
+                            <span class="cmh-label" style="cursor:default;">Mode</span>
+                        </div>
+                        <select class="cmh-select" id="cmh-set-mode">
+                            <option value="drag" ${SETTINGS.autoMoveMode === 'drag' ? 'selected' : ''}>🖱️ Drag & Drop</option>
+                            <option value="click" ${SETTINGS.autoMoveMode === 'click' ? 'selected' : ''}>👆 Click-Click</option>
+                        </select>
+                        <div class="cmh-row cmh-row-between" style="margin-top:6px;">
+                            <span class="cmh-label" style="cursor:default;font-size:11px;">Jitter (× cell)</span>
+                            <span class="cmh-value" id="cmh-lbl-jitter">${SETTINGS.jitterScale.toFixed(2)}</span>
+                        </div>
+                        <input type="range" class="cmh-range" id="cmh-set-jitter" min="0" max="1" step="0.05" value="${SETTINGS.jitterScale}">
+                        <div class="cmh-row cmh-row-between" style="margin-top:6px;">
+                            <span class="cmh-label" style="cursor:default;font-size:11px;">Reaction Min</span>
+                            <span class="cmh-value" id="cmh-lbl-rtMin">${SETTINGS.reactionTimeMin}ms</span>
+                        </div>
+                        <input type="range" class="cmh-range" id="cmh-set-rtMin" min="50" max="800" step="10" value="${SETTINGS.reactionTimeMin}">
+                        <div class="cmh-row cmh-row-between" style="margin-top:6px;">
+                            <span class="cmh-label" style="cursor:default;font-size:11px;">Reaction Max</span>
+                            <span class="cmh-value" id="cmh-lbl-rtMax">${SETTINGS.reactionTimeMax}ms</span>
+                        </div>
+                        <input type="range" class="cmh-range" id="cmh-set-rtMax" min="200" max="2500" step="50" value="${SETTINGS.reactionTimeMax}">
+                        <div class="cmh-row cmh-row-between" style="margin-top:6px;">
+                            <span class="cmh-label" style="cursor:default;font-size:11px;">Extra Delay</span>
+                            <span class="cmh-value" id="cmh-lbl-delay">${SETTINGS.autoMoveDelay}ms</span>
+                        </div>
+                        <input type="range" class="cmh-range" id="cmh-set-delay" min="0" max="2000" step="50" value="${SETTINGS.autoMoveDelay}">
+                        <div class="cmh-row" style="margin-top:6px;">
+                            <label class="cmh-label" style="font-size:11px;"><input type="checkbox" id="cmh-set-humanize" ${SETTINGS.autoMoveHumanize ? 'checked' : ''}> Enable humanize</label>
+                        </div>
+                    </div>
+
+                </div>
+            </div>
+        `;
+        document.body.appendChild(panel);
+
+        setupDrag(panel);
+        bindUI();
+        clampPanelToViewport(panel);
+        window.addEventListener('resize', () => clampPanelToViewport(panel));
+        window.addEventListener('orientationchange', () => setTimeout(() => clampPanelToViewport(panel), 200));
+    }
+
+    // ==================== PANEL DRAG ====================
+    function setupDrag(panel) {
+        const header = document.getElementById('cmh-drag-header');
+        let dragging = false, offsetX = 0, offsetY = 0, activeId = null;
+
+        function getPos(e) {
+            if (e.touches && e.touches.length) return { x: e.touches[0].clientX, y: e.touches[0].clientY };
+            if (e.changedTouches && e.changedTouches.length) return { x: e.changedTouches[0].clientX, y: e.changedTouches[0].clientY };
+            return { x: e.clientX, y: e.clientY };
+        }
+
+        function start(e) {
+            if (e.target && e.target.closest('button')) return;
+            dragging = true;
+            const p = getPos(e);
+            const rect = panel.getBoundingClientRect();
+            offsetX = Math.max(0, Math.min(p.x - rect.left, rect.width));
+            offsetY = Math.max(0, Math.min(p.y - rect.top, rect.height));
+            if (e.pointerId !== undefined) activeId = e.pointerId;
+            if (e.cancelable) e.preventDefault();
+        }
+        function move(e) {
+            if (!dragging) return;
+            if (activeId !== null && e.pointerId !== undefined && e.pointerId !== activeId) return;
+            const p = getPos(e);
+            let x = p.x - offsetX, y = p.y - offsetY;
+            const maxX = window.innerWidth - panel.offsetWidth;
+            const maxY = window.innerHeight - panel.offsetHeight;
+            x = Math.max(0, Math.min(x, maxX));
+            y = Math.max(0, Math.min(y, maxY));
+            panel.style.left = x + 'px';
+            panel.style.top = y + 'px';
+            if (e.cancelable) e.preventDefault();
+        }
+        function end(e) {
+            if (!dragging) return;
+            dragging = false;
+            activeId = null;
+            try {
+                localStorage.setItem(PANEL_POS_KEY, JSON.stringify({
+                    x: parseInt(panel.style.left, 10) || 12,
+                    y: parseInt(panel.style.top, 10) || 12
+                }));
+            } catch (err) {}
+            if (e && e.cancelable) e.preventDefault();
+        }
+
+        if (window.PointerEvent) {
+            header.addEventListener('pointerdown', start, { passive: false });
+            document.addEventListener('pointermove', move, { passive: false });
+            document.addEventListener('pointerup', end, { passive: false });
+            document.addEventListener('pointercancel', end, { passive: false });
+        } else {
+            header.addEventListener('mousedown', start);
+            document.addEventListener('mousemove', move);
+            document.addEventListener('mouseup', end);
+            header.addEventListener('touchstart', start, { passive: false });
+            document.addEventListener('touchmove', move, { passive: false });
+            document.addEventListener('touchend', end, { passive: false });
+        }
+    }
+
+    function clampPanelToViewport(panel) {
+        const rect = panel.getBoundingClientRect();
+        let x = parseInt(panel.style.left, 10) || 12;
+        let y = parseInt(panel.style.top, 10) || 12;
+        const maxX = Math.max(0, window.innerWidth - rect.width);
+        const maxY = Math.max(0, window.innerHeight - rect.height);
+        x = Math.max(0, Math.min(x, maxX));
+        y = Math.max(0, Math.min(y, maxY));
+        panel.style.left = x + 'px';
+        panel.style.top = y + 'px';
+    }
+
+    createPanel();
+
+    // ==================== UI BINDINGS ====================
+    function bindUI() {
+        const $ = id => document.getElementById(id);
+        const on = (id, evt, fn) => { const el = $(id); if (el) el.addEventListener(evt, fn); };
+
+        on('cmh-btn-collapse', 'click', (e) => {
+            e.stopPropagation();
+            const body = $('cmh-body');
+            const hidden = body.style.display === 'none';
+            body.style.display = hidden ? 'flex' : 'none';
+            $('cmh-btn-collapse').innerHTML = hidden
+                ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px;"><polyline points="6 9 12 15 18 9"/></svg>'
+                : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px;"><polyline points="9 18 15 12 9 6"/></svg>';
+            localStorage.setItem(PANEL_COLLAPSED_KEY, hidden ? '0' : '1');
+        });
+
+        const toggleSettings = (e) => {
+            e.stopPropagation();
+            $('cmh-settings').classList.toggle('open');
+        };
+        on('cmh-btn-settings', 'click', toggleSettings);
+        on('cmh-btn-settings2', 'click', toggleSettings);
+
+        on('cmh-btn-analyze', 'click', () => analyze());
+
+        on('cmh-btn-reset', 'click', () => {
+            clearState();
+            setStatus('State cleared.', 'ok');
+            $('cmh-chosen').classList.add('hidden');
+            $('cmh-moves-section').style.display = 'none';
+            $('cmh-empty').style.display = 'block';
+            lastKnownMoveCount = -1;
+            lastKnownLastMove = '';
+            lastAnalyzedFen = null;
+            lastBestMove = null;
+            lastLines = [];
+            clearOverlay();
+            redrawAllArrows();
+        });
+
+        // Colors
+        ['bestColor','colorExcellent','colorGood','colorInaccuracy','colorMistake','colorBlunder'].forEach(key => {
+            on('cmh-set-' + key, 'input', e => {
+                SETTINGS[key] = e.target.value;
+                saveSettings();
+                redrawAllArrows();
+            });
+        });
+        ['showBest','showExcellent','showGood','showInaccuracy','showMistake','showBlunder'].forEach(key => {
+            on('cmh-set-' + key, 'change', e => {
+                SETTINGS[key] = e.target.checked;
+                saveSettings();
+                redrawAllArrows();
+            });
+        });
+
+        const bindRange = (id, labelId, key, isInt, after, suffix = '') => {
+            const el = $(id); const lbl = $(labelId);
+            if (!el) return;
+            el.addEventListener('input', e => {
+                const v = isInt ? parseInt(e.target.value, 10) : parseFloat(e.target.value);
+                SETTINGS[key] = v;
+                if (lbl) lbl.textContent = (isInt || Number.isInteger(v) ? v : v.toFixed(2)) + suffix;
+                saveSettings();
+                if (after) after();
+            });
+        };
+        bindRange('cmh-set-bestW', 'cmh-lbl-bestW', 'bestLineWidth', false, redrawAllArrows);
+        bindRange('cmh-set-multiW', 'cmh-lbl-multiW', 'multiLineWidth', false, redrawAllArrows);
+        bindRange('cmh-set-multiO', 'cmh-lbl-multiO', 'multiLineOpacity', false, redrawAllArrows);
+        bindRange('cmh-set-thEx', 'cmh-lbl-thEx', 'thresholdExcellent', false, redrawAllArrows);
+        bindRange('cmh-set-thGood', 'cmh-lbl-thGood', 'thresholdGood', false, redrawAllArrows);
+        bindRange('cmh-set-thIn', 'cmh-lbl-thIn', 'thresholdInaccuracy', false, redrawAllArrows);
+        bindRange('cmh-set-thMis', 'cmh-lbl-thMis', 'thresholdMistake', false, redrawAllArrows);
+        bindRange('cmh-set-wp', 'cmh-lbl-wp', 'autoMoveWeightPower', false);
+        bindRange('cmh-set-minwr', 'cmh-lbl-minwr', 'autoMoveMinWinrate', false);
+        bindRange('cmh-set-topN', 'cmh-lbl-topN', 'autoMoveTopN', true);
+        bindRange('cmh-set-jitter', 'cmh-lbl-jitter', 'jitterScale', false);
+        bindRange('cmh-set-rtMin', 'cmh-lbl-rtMin', 'reactionTimeMin', true, null, 'ms');
+        bindRange('cmh-set-rtMax', 'cmh-lbl-rtMax', 'reactionTimeMax', true, null, 'ms');
+        bindRange('cmh-set-delay', 'cmh-lbl-delay', 'autoMoveDelay', true, null, 'ms');
+
+        on('cmh-set-strategy', 'change', e => { SETTINGS.autoMoveStrategy = e.target.value; saveSettings(); });
+        on('cmh-set-mode', 'change', e => { SETTINGS.autoMoveMode = e.target.value; saveSettings(); });
+
+        on('cmh-set-humanize', 'change', e => { SETTINGS.autoMoveHumanize = e.target.checked; saveSettings(); });
+        on('cmh-set-excludeBlunder', 'change', e => { SETTINGS.autoMoveExcludeBlunder = e.target.checked; saveSettings(); });
+        on('cmh-set-excludeMistake', 'change', e => { SETTINGS.autoMoveExcludeMistake = e.target.checked; saveSettings(); });
+
+        on('cmh-allow-outside', 'change', e => {
+            if (e.target.checked && !IS_ANALYSIS) {
+                const ok = confirm(
+                    'PERINGATAN: Auto-move di luar halaman analisis.\n\n' +
+                    'Jika digunakan di permainan berperingkat, akun Anda bisa diblokir permanen oleh Chess.com.\n\n' +
+                    'Gunakan hanya untuk permainan kasual, bot, atau latihan.\n\n' +
+                    'Lanjutkan?'
+                );
+                if (!ok) { e.target.checked = false; return; }
+            }
+            setAutoOutsideAnalysisAllowed(e.target.checked);
+            const autoMove = $('cmh-auto-move');
+            if (autoMove) {
+                if (e.target.checked) {
+                    autoMove.disabled = false;
+                    setStatus('Override enabled — auto-move available everywhere.', 'warn');
+                } else if (!IS_ANALYSIS) {
+                    autoMove.disabled = true;
+                    autoMove.checked = false;
+                    setStatus('Override disabled — auto-move restricted to analysis.', 'ok');
+                }
+            }
+        });
+
+        // ==================== AUTO-DETECT BINDINGS ====================
+        document.querySelectorAll('input[name="cmh-side"]').forEach(r => {
+            r.addEventListener('change', () => {
+                if (r.checked && !userOverrideSide) {
+                    handleManualOverride();
+                }
+            });
+        });
+
+        on('cmh-btn-redetect', 'click', () => {
+            resetAutoDetect();
+            showToast('🔄 Auto-detect re-enabled', 'ok');
+        });
+
+        // Initial detection (retry loop handled inside)
+        tryDetectSide();
+    }
+
+    // ==================== TOAST + STATUS ====================
+    let toastTimer = null;
+    function showToast(msg, type = 'ok') {
+        let toast = document.getElementById('cmh-toast');
+        if (!toast) {
+            toast = document.createElement('div');
+            toast.id = 'cmh-toast';
+            toast.className = 'cmh-toast';
+            document.body.appendChild(toast);
+        }
+        toast.className = 'cmh-toast show ' + type;
+        toast.textContent = msg;
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => toast.classList.remove('show'), 2200);
+    }
+
+    function setStatus(msg, type = 'ok') {
+        const el = document.getElementById('cmh-status');
+        if (!el) return;
+        const isLoad = msg.includes('Analyzing') || msg.includes('loading') || msg.includes('Initializing');
+        el.className = 'cmh-status'
+            + (type === 'warn' ? ' cmh-status-warn' : type === 'error' ? ' cmh-status-error' : '')
+            + (isLoad ? ' cmh-status-loading' : '');
+        el.textContent = msg;
+    }
+
+    // ==================== ENGINE ====================
+    let sfWorker = null;
+
+    async function initEngine() {
+        try {
+            setStatus('Initializing engine...');
+            const resp = await fetch('https://cdnjs.cloudflare.com/ajax/libs/stockfish.js/10.0.1/stockfish.js');
+            if (!resp.ok) throw new Error('HTTP ' + resp.status);
+            const code = await resp.text();
+            sfWorker = new Worker(URL.createObjectURL(new Blob([code], { type: 'application/javascript' })));
+            sfWorker.postMessage('setoption name MultiPV value ' + MULTIPV);
+            setStatus('Engine ready. Waiting for moves...');
+        } catch (e) {
+            setStatus('Engine load failed: ' + e.message, 'error');
+        }
+    }
+    initEngine();
+
+    // ==================== MOVE LIST EXTRACTION ====================
+    function extractSanFromNode(node) {
+        let san = '';
+        for (const child of node.childNodes) {
+            if (child.nodeType === Node.TEXT_NODE) san += child.textContent;
+            else if (child.nodeType === Node.ELEMENT_NODE) {
+                if (child.hasAttribute('data-move-list-el')) continue;
+                if (child.classList && child.classList.contains('timestamp')) continue;
+                const fig = child.getAttribute('data-figurine');
+                if (fig) san += fig;
+                else san += extractSanFromNode(child);
+            }
+        }
+        return san;
+    }
+
+    function readMovesFromList() {
+        const list = document.querySelector(OBSERVE_ROOT_SELECTOR);
+        if (!list) return null;
+        const moves = [];
+        list.querySelectorAll('[data-node]').forEach(node => {
+            const raw = extractSanFromNode(node);
+            const normalized = normalizeSan(raw);
+            if (normalized) moves.push(normalized);
+        });
+        return moves.length ? moves : null;
+    }
+
+    // ==================== POSITION BUILDING ====================
+    function rebuildFromSaved(saved) {
+        const chess = new Chess();
+        for (const san of saved.moves) if (!chess.move(san)) break;
+        return chess;
+    }
+
+    function buildPosition() {
+        const domMoves = readMovesFromList();
+        const saved = loadState();
+        if (!domMoves && !saved) return null;
+        if (!domMoves) return { chess: rebuildFromSaved(saved), moves: saved.moves };
+        if (!saved) {
+            const chess = new Chess();
+            const applied = [];
+            for (const san of domMoves) { if (!chess.move(san)) break; applied.push(san); }
+            saveState({ moves: applied, fen: chess.fen(), ts: Date.now() });
+            return { chess, moves: applied };
+        }
+        let common = 0;
+        const minLen = Math.min(domMoves.length, saved.moves.length);
+        for (let i = 0; i < minLen; i++) { if (domMoves[i] === saved.moves[i]) common++; else break; }
+        if (common === saved.moves.length && domMoves.length > saved.moves.length) {
+            const chess = new Chess(saved.fen);
+            const applied = saved.moves.slice();
+            for (let i = saved.moves.length; i < domMoves.length; i++) {
+                if (!chess.move(domMoves[i])) break;
+                applied.push(domMoves[i]);
+            }
+            saveState({ moves: applied, fen: chess.fen(), ts: Date.now() });
+            return { chess, moves: applied };
+        }
+        if (common === domMoves.length && common === saved.moves.length) return { chess: rebuildFromSaved(saved), moves: saved.moves };
+        if (common === domMoves.length && domMoves.length < saved.moves.length) return { chess: rebuildFromSaved(saved), moves: saved.moves };
+        const chess = new Chess();
+        const applied = [];
+        for (const san of domMoves) { if (!chess.move(san)) break; applied.push(san); }
+        saveState({ moves: applied, fen: chess.fen(), ts: Date.now() });
+        return { chess, moves: applied };
+    }
+
+    // ==================== ANALYZE ====================
+    let analyzing = false;
+    let lastBestMove = null;
+    let lastAnalyzedFen = null;
+    let lastLines = [];
+    let lastSide = null;
+
+    function classifyMove(score, bestScore) {
+        const drop = bestScore - score;
+        if (drop <= SETTINGS.thresholdExcellent) return 'excellent';
+        if (drop <= SETTINGS.thresholdGood) return 'good';
+        if (drop <= SETTINGS.thresholdInaccuracy) return 'inaccuracy';
+        if (drop <= SETTINGS.thresholdMistake) return 'mistake';
+        return 'blunder';
+    }
+
+    function scoreToLabel(score) {
+        if (score >= 100) return '+M';
+        if (score <= -100) return '-M';
+        return (score > 0 ? '+' : '') + score.toFixed(2);
+    }
+
+    function capitalize(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
+
+    function evalToWinrate(evalPawns) {
+        return 1 / (1 + Math.pow(10, -evalPawns / 4));
+    }
+
+    function pickMoveWeighted(candidates) {
+        if (!candidates || candidates.length === 0) return null;
+        const strategy = SETTINGS.autoMoveStrategy;
+        const topN = Math.min(SETTINGS.autoMoveTopN, candidates.length);
+        const top = candidates.slice(0, topN);
+        const filtered = top.filter(c => {
+            if (SETTINGS.autoMoveExcludeBlunder && c.category === 'blunder') return false;
+            if (SETTINGS.autoMoveExcludeMistake && c.category === 'mistake') return false;
+            if (c.winrate < SETTINGS.autoMoveMinWinrate) return false;
+            return true;
+        });
+        const pool = filtered.length > 0 ? filtered : [top[0]];
+        if (strategy === 'best') return pool[0];
+        if (strategy === 'random') return pool[Math.floor(Math.random() * pool.length)];
+        const power = SETTINGS.autoMoveWeightPower;
+        const weights = pool.map(c => Math.pow(Math.max(0.001, c.winrate), power));
+        const total = weights.reduce((a, b) => a + b, 0);
+        let r = Math.random() * total;
+        for (let i = 0; i < pool.length; i++) { r -= weights[i]; if (r <= 0) return pool[i]; }
+        return pool[pool.length - 1];
+    }
+
+    function analyze() {
+        if (analyzing) return;
+        if (!sfWorker) { setStatus('Engine not ready', 'error'); return; }
+        if (typeof Chess === 'undefined') { setStatus('chess.js not loaded', 'error'); return; }
+
+        const side = document.querySelector('input[name="cmh-side"]:checked').value;
+        const result = buildPosition();
+        if (!result) { setStatus('No moves to analyze', 'warn'); return; }
+
+        const { chess, moves } = result;
+        if (chess.turn() !== side) {
+            setStatus(`It is ${chess.turn() === 'w' ? 'White' : 'Black'}'s turn`, 'warn');
+            document.getElementById('cmh-chosen').classList.add('hidden');
+            document.getElementById('cmh-move-list').innerHTML = '';
+            document.getElementById('cmh-moves-section').style.display = 'none';
+            document.getElementById('cmh-empty').style.display = 'block';
+            clearOverlay();
+            return;
+        }
+
+        const fen = chess.fen();
+        if (fen === lastAnalyzedFen && lastBestMove) return;
+
+        analyzing = true;
+        lastLines = [];
+        lastSide = side;
+        setStatus(`Analyzing position (${moves.length} moves)...`, 'loading');
+        document.getElementById('cmh-moves-section').style.display = 'none';
+        document.getElementById('cmh-empty').style.display = 'none';
+        document.getElementById('cmh-chosen').classList.add('hidden');
+
+        sfWorker.postMessage('setoption name MultiPV value ' + MULTIPV);
+        sfWorker.postMessage('position fen ' + fen);
+        sfWorker.postMessage('go depth ' + DEPTH);
+
+        const lines = {};
+        sfWorker.onmessage = function (event) {
+            const line = event.data;
+            if (typeof line !== 'string') return;
+            if (line.startsWith('info') && line.indexOf(' pv ') !== -1) {
+                const mpvMatch = line.match(/multipv (\d+)/);
+                const mpvIdx = mpvMatch ? parseInt(mpvMatch[1], 10) : 1;
+                const scoreMatch = line.match(/score (cp|mate) (-?\d+)/);
+                if (!scoreMatch) return;
+                const scoreType = scoreMatch[1];
+                const scoreVal = parseInt(scoreMatch[2], 10);
+                const scorePawns = scoreType === 'cp' ? scoreVal / 100 : (scoreVal > 0 ? 100 : -100);
+                const pvMatch = line.match(/\spv\s+(\S+)/);
+                const firstMove = pvMatch ? pvMatch[1] : null;
+                if (!firstMove) return;
+                lines[mpvIdx] = { uci: firstMove, score: scorePawns };
+            }
+            if (line.startsWith('bestmove')) {
+                analyzing = false;
+                const arr = Object.keys(lines).map(k => ({ idx: parseInt(k, 10), ...lines[k] }));
+                arr.sort((a, b) => a.idx - b.idx);
+                lastLines = arr;
+                if (arr.length === 0) { setStatus('No move available', 'warn'); return; }
+                const best = arr[0];
+                lastBestMove = best.uci;
+                lastAnalyzedFen = fen;
+                setStatus(`Analysis complete — ${arr.length} candidates found.`, 'ok');
+                renderMultiMoveList(arr);
+                drawAllArrows(arr);
+                maybeAutoMoveSmart(arr, side);
+            }
+        };
+    }
+
+    // ==================== RENDER MOVE LIST ====================
+    const CATEGORY_META = {
+        best: { label: 'Best', icon: '★' },
+        excellent: { label: 'Excellent', icon: '◆' },
+        good: { label: 'Good', icon: '●' },
+        inaccuracy: { label: 'Inaccuracy', icon: '▲' },
+        mistake: { label: 'Mistake', icon: '⚠' },
+        blunder: { label: 'Blunder', icon: '✖' },
+    };
+
+    function renderMultiMoveList(lines) {
+        const listEl = document.getElementById('cmh-move-list');
+        const sectionEl = document.getElementById('cmh-moves-section');
+        if (!listEl) return;
+        listEl.innerHTML = '';
+        const bestScore = lines[0].score;
+        let anyShown = false;
+        lines.forEach((line, i) => {
+            const isBest = i === 0;
+            let category, color;
+            if (isBest) { category = 'best'; color = SETTINGS.bestColor; }
+            else {
+                category = classifyMove(line.score, bestScore);
+                color = SETTINGS['color' + capitalize(category)] || '#999';
+            }
+            const show = isBest ? SETTINGS.showBest : SETTINGS['show' + capitalize(category)];
+            if (!show) return;
+            anyShown = true;
+
+            const meta = CATEGORY_META[category] || { label: category, icon: '?' };
+            const drop = bestScore - line.score;
+            const scoreStr = scoreToLabel(line.score);
+            const wr = evalToWinrate(line.score);
+            const wrStr = Math.round(wr * 100) + '%';
+
+            const row = document.createElement('div');
+            row.className = 'cmh-move-item';
+            row.style.borderLeftColor = color;
+            row.style.color = color;
+            row.innerHTML = `
+                <span class="cmh-move-badge" style="background:${color};">${meta.icon} ${meta.label}</span>
+                <span class="cmh-move-uci" style="color:#e3e1de;">${line.uci}</span>
+                <span class="cmh-move-score" title="Score ${scoreStr}, Winrate ${wrStr}">${scoreStr} · ${wrStr}</span>
+                <span class="cmh-move-winbar" style="width:${wr * 100}%;color:${color};"></span>
+            `;
+            listEl.appendChild(row);
+        });
+        sectionEl.style.display = anyShown ? 'block' : 'none';
+        document.getElementById('cmh-empty').style.display = anyShown ? 'none' : 'block';
+    }
+
+    // ==================== ARROW DRAWING ====================
+    function getBoardInfo() {
+        const board = document.querySelector(BOARD_SELECTOR);
+        if (!board) return null;
+        const bRect = board.getBoundingClientRect();
+        if (bRect.width < 10) return null;
+        return { board, flipped: board.classList.contains('flipped'), bRect };
+    }
+
+    function squareToViewportCoords(square, bRect, flipped) {
+        const file = square.charCodeAt(0) - 97;
+        const rank = parseInt(square[1], 10) - 1;
+        const cellW = bRect.width / 8;
+        const cellH = bRect.height / 8;
+        let col, row;
+        if (!flipped) { col = file; row = 7 - rank; }
+        else { col = 7 - file; row = rank; }
+        return {
+            x: bRect.left + col * cellW + cellW / 2,
+            y: bRect.top + row * cellH + cellH / 2,
+            cellW, cellH
+        };
+    }
+
+    let overlaySvg = null;
+    function ensureOverlaySvg() {
+        if (!overlaySvg || !overlaySvg.parentNode) {
+            overlaySvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+            overlaySvg.setAttribute('data-chess-overlay', 'best');
+            overlaySvg.style.cssText = `
+                position: fixed; top: 0; left: 0;
+                width: 100vw; height: 100vh;
+                pointer-events: none;
+                z-index: 2147483647;
+                overflow: visible;
+            `;
+            document.body.appendChild(overlaySvg);
+        }
+        return overlaySvg;
+    }
+    function clearOverlay() {
+        if (overlaySvg) while (overlaySvg.firstChild) overlaySvg.removeChild(overlaySvg.firstChild);
+    }
+
+    function drawArrow(from, to, color, width, opacity, circleRadius) {
+        const info = getBoardInfo();
+        if (!info) return;
+        const svg = ensureOverlaySvg();
+        if (from.length !== 2 || to.length !== 2) return;
+        const fromCoord = squareToViewportCoords(from, info.bRect, info.flipped);
+        const toCoord = squareToViewportCoords(to, info.bRect, info.flipped);
+
+        const glowId = 'glow_' + Math.random().toString(36).slice(2);
+        const defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
+        const filter = document.createElementNS('http://www.w3.org/2000/svg', 'filter');
+        filter.setAttribute('id', glowId);
+        filter.setAttribute('x', '-50%'); filter.setAttribute('y', '-50%');
+        filter.setAttribute('width', '200%'); filter.setAttribute('height', '200%');
+        const blur = document.createElementNS('http://www.w3.org/2000/svg', 'feGaussianBlur');
+        blur.setAttribute('stdDeviation', '2');
+        blur.setAttribute('result', 'coloredBlur');
+        const merge = document.createElementNS('http://www.w3.org/2000/svg', 'feMerge');
+        const m1 = document.createElementNS('http://www.w3.org/2000/svg', 'feMergeNode'); m1.setAttribute('in', 'coloredBlur');
+        const m2 = document.createElementNS('http://www.w3.org/2000/svg', 'feMergeNode'); m2.setAttribute('in', 'SourceGraphic');
+        merge.appendChild(m1); merge.appendChild(m2);
+        filter.appendChild(blur); filter.appendChild(merge);
+        defs.appendChild(filter);
+        svg.appendChild(defs);
+
+        const dx = toCoord.x - fromCoord.x;
+        const dy = toCoord.y - fromCoord.y;
+        const angle = Math.atan2(dy, dx);
+        const halfW = width / 2;
+        const offsetX = halfW * Math.sin(angle);
+        const offsetY = halfW * Math.cos(angle);
+
+        const polygon = document.createElementNS('http://www.w3.org/2000/svg', 'polygon');
+        polygon.setAttribute('points', `
+            ${fromCoord.x - offsetX},${fromCoord.y + offsetY}
+            ${toCoord.x - offsetX},${toCoord.y + offsetY}
+            ${toCoord.x + offsetX},${toCoord.y - offsetY}
+            ${fromCoord.x + offsetX},${fromCoord.y - offsetY}
+        `);
+        polygon.setAttribute('fill', color);
+        polygon.setAttribute('opacity', String(opacity));
+        polygon.setAttribute('filter', `url(#${glowId})`);
+        svg.appendChild(polygon);
+
+        const circleStart = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+        circleStart.setAttribute('cx', String(fromCoord.x));
+        circleStart.setAttribute('cy', String(fromCoord.y));
+        circleStart.setAttribute('r', String(halfW));
+        circleStart.setAttribute('fill', color);
+        circleStart.setAttribute('opacity', String(opacity));
+        circleStart.setAttribute('filter', `url(#${glowId})`);
+        svg.appendChild(circleStart);
+
+        const circleEnd = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+        circleEnd.setAttribute('cx', String(toCoord.x));
+        circleEnd.setAttribute('cy', String(toCoord.y));
+        circleEnd.setAttribute('r', String(circleRadius));
+        circleEnd.setAttribute('fill', color);
+        circleEnd.setAttribute('opacity', String(opacity));
+        circleEnd.setAttribute('filter', `url(#${glowId})`);
+        svg.appendChild(circleEnd);
+    }
+
+    function drawAllArrows(lines) {
+        clearOverlay();
+        if (!lines || lines.length === 0) return;
+        const bestScore = lines[0].score;
+        const ordered = [...lines].sort((a, b) => a.score - b.score);
+        ordered.forEach((line) => {
+            const isBest = line.uci === lines[0].uci;
+            const from = line.uci.substring(0, 2);
+            const to = line.uci.substring(2, 4);
+            let color, width, opacity, circleRadius, show;
+            if (isBest) {
+                color = SETTINGS.bestColor;
+                width = SETTINGS.bestLineWidth;
+                opacity = SETTINGS.bestOpacity;
+                circleRadius = SETTINGS.bestCircleRadius;
+                show = SETTINGS.showBest;
+            } else {
+                const cat = classifyMove(line.score, bestScore);
+                color = SETTINGS['color' + capitalize(cat)] || '#999';
+                width = SETTINGS.multiLineWidth;
+                opacity = SETTINGS.multiLineOpacity;
+                circleRadius = SETTINGS.multiCircleRadius;
+                show = SETTINGS['show' + capitalize(cat)];
+            }
+            if (!show) return;
+            drawArrow(from, to, color, width, opacity, circleRadius);
+        });
+    }
+
+    function redrawAllArrows() {
+        if (lastLines && lastLines.length > 0) drawAllArrows(lastLines);
+    }
+
+    // ==================== SIMULATION UTILS ====================
+    function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+    function gaussian(mean = 0, stdDev = 1) {
+        let u = 0, v = 0;
+        while (u === 0) u = Math.random();
+        while (v === 0) v = Math.random();
+        return mean + stdDev * Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+    }
+
+    function reactionTimeSample() {
+        const min = SETTINGS.reactionTimeMin;
+        const max = SETTINGS.reactionTimeMax;
+        const median = (min + max) / 2;
+        const sigma = 0.45;
+        const mu = Math.log(Math.max(50, median));
+        let t = Math.exp(mu + sigma * gaussian(0, 1));
+        return Math.max(min, Math.min(max * 1.2, t));
+    }
+
+    function jitter(maxCell) {
+        if (!SETTINGS.autoMoveHumanize) return { x: 0, y: 0 };
+        const scale = SETTINGS.jitterScale;
+        if (scale <= 0) return { x: 0, y: 0 };
+        const maxJitter = maxCell * scale;
+        const sigma = maxJitter * 0.4;
+        const x = Math.max(-maxJitter, Math.min(maxJitter, gaussian(0, sigma)));
+        const y = Math.max(-maxJitter, Math.min(maxJitter, gaussian(0, sigma)));
+        return { x, y };
+    }
+
+    function firePointer(target, type, x, y, opts = {}) {
+        const base = {
+            bubbles: true, cancelable: true, composed: true,
+            clientX: x, clientY: y, screenX: x, screenY: y,
+            button: 0, buttons: type === 'pointerdown' || type === 'pointermove' ? 1 : 0,
+            pointerId: 1, pointerType: 'mouse', isPrimary: true,
+            view: window, ...opts
+        };
+        try { target.dispatchEvent(new PointerEvent(type, base)); }
+        catch (e) { target.dispatchEvent(new MouseEvent(type.replace('pointer', 'mouse'), base)); }
+    }
+    function fireMouse(target, type, x, y) {
+        target.dispatchEvent(new MouseEvent(type, {
+            bubbles: true, cancelable: true, composed: true,
+            clientX: x, clientY: y, screenX: x, screenY: y,
+            button: 0, buttons: type === 'mousedown' || type === 'mousemove' ? 1 : 0,
+            view: window
+        }));
+    }
+
+    // ==================== SIMULATE DRAG (v1.7 proven method) ====================
+    async function simulateDragDrop(startX, startY, endX, endY, cellW, cellH) {
+        const humanize = SETTINGS.autoMoveHumanize;
+        const maxCell = Math.min(cellW, cellH);
+        const startEl = document.elementFromPoint(startX, startY);
+        if (!startEl) throw new Error('no element at start');
+
+        const j0 = jitter(maxCell);
+        const sx = startX + j0.x;
+        const sy = startY + j0.y;
+        let startTarget = document.elementFromPoint(sx, sy) || startEl;
+
+        firePointer(startTarget, 'pointerdown', sx, sy);
+        fireMouse(startTarget, 'mousedown', sx, sy);
+        await sleep(humanize ? 40 + Math.random() * 40 : 20);
+
+        const steps = humanize ? 14 + Math.floor(Math.random() * 6) : 10;
+        const curveOffset = humanize ? (Math.random() - 0.5) * maxCell * 0.4 : 0;
+        const perpX = -(endY - startY);
+        const perpY = (endX - startX);
+        const perpLen = Math.hypot(perpX, perpY) || 1;
+        const midOffsetX = (perpX / perpLen) * curveOffset;
+        const midOffsetY = (perpY / perpLen) * curveOffset;
+        const pauseAt = humanize ? Math.floor(steps * (0.4 + Math.random() * 0.2)) : -1;
+
+        for (let i = 1; i <= steps; i++) {
+            const t = i / steps;
+            const curveAmount = Math.sin(t * Math.PI);
+            const x = startX + (endX - startX) * t + midOffsetX * curveAmount;
+            const y = startY + (endY - startY) * t + midOffsetY * curveAmount;
+            const jm = humanize ? jitter(maxCell * 0.2) : { x: 0, y: 0 };
+            const px = x + jm.x;
+            const py = y + jm.y;
+            const target = document.elementFromPoint(px, py) || startEl;
+            firePointer(target, 'pointermove', px, py);
+            fireMouse(target, 'mousemove', px, py);
+            let stepDelay = humanize ? 10 + Math.random() * 18 : 8;
+            if (i === pauseAt) stepDelay += humanize ? 40 + Math.random() * 80 : 0;
+            await sleep(stepDelay);
+        }
+
+        await sleep(humanize ? 50 + Math.random() * 60 : 25);
+        const endTarget = document.elementFromPoint(endX, endY) || startEl;
+        firePointer(endTarget, 'pointerup', endX, endY);
+        fireMouse(endTarget, 'mouseup', endX, endY);
+        fireMouse(endTarget, 'click', endX, endY);
+    }
+
+    // ==================== SIMULATE CLICK-CLICK ====================
+    async function simulateClickClick(startX, startY, endX, endY, cellW, cellH) {
+        const humanize = SETTINGS.autoMoveHumanize;
+        const maxCell = Math.min(cellW, cellH);
+        const startEl = document.elementFromPoint(startX, startY);
+        if (!startEl) throw new Error('no element at start');
+
+        const j1 = jitter(maxCell);
+        const s1x = startX + j1.x;
+        const s1y = startY + j1.y;
+        const s1El = document.elementFromPoint(s1x, s1y) || startEl;
+
+        firePointer(s1El, 'pointerdown', s1x, s1y);
+        fireMouse(s1El, 'mousedown', s1x, s1y);
+        await sleep(humanize ? 30 + Math.random() * 30 : 15);
+        firePointer(s1El, 'pointerup', s1x, s1y);
+        fireMouse(s1El, 'mouseup', s1x, s1y);
+        fireMouse(s1El, 'click', s1x, s1y);
+
+        if (humanize) {
+            const hoverSteps = 6 + Math.floor(Math.random() * 4);
+            for (let i = 1; i <= hoverSteps; i++) {
+                const t = i / hoverSteps;
+                const x = startX + (endX - startX) * t;
+                const y = startY + (endY - startY) * t;
+                const target = document.elementFromPoint(x, y) || startEl;
+                firePointer(target, 'pointermove', x, y);
+                fireMouse(target, 'mousemove', x, y);
+                await sleep(12 + Math.random() * 15);
+            }
+        }
+        await sleep(humanize ? reactionTimeSample() * 0.4 : 80);
+
+        const j2 = jitter(maxCell);
+        const e2x = endX + j2.x;
+        const e2y = endY + j2.y;
+        const e2El = document.elementFromPoint(e2x, e2y) || startEl;
+
+        firePointer(e2El, 'pointerdown', e2x, e2y);
+        fireMouse(e2El, 'mousedown', e2x, e2y);
+        await sleep(humanize ? 25 + Math.random() * 30 : 12);
+        firePointer(e2El, 'pointerup', e2x, e2y);
+        fireMouse(e2El, 'mouseup', e2x, e2y);
+        fireMouse(e2El, 'click', e2x, e2y);
+    }
+
+    // ==================== SMART AUTO MOVE ====================
+    async function maybeAutoMoveSmart(lines, side) {
+        const autoMoveBox = document.getElementById('cmh-auto-move');
+        if (!autoMoveBox || !autoMoveBox.checked) return;
+        if (!IS_ANALYSIS && !isAutoOutsideAnalysisAllowed()) return;
+        const info = getBoardInfo();
+        if (!info) return;
+        if (!lines || lines.length === 0) return;
+
+        const bestScore = lines[0].score;
+        const candidates = lines.map((line, i) => {
+            const category = i === 0 ? 'best' : classifyMove(line.score, bestScore);
+            return { uci: line.uci, score: line.score, category, winrate: evalToWinrate(line.score), isBest: i === 0 };
+        });
+        const chosen = pickMoveWeighted(candidates);
+        if (!chosen) return;
+
+        const chosenEl = document.getElementById('cmh-chosen');
+        if (chosenEl) {
+            chosenEl.classList.remove('hidden');
+            const catLabel = chosen.isBest ? 'BEST' : chosen.category.toUpperCase();
+            const strat = SETTINGS.autoMoveStrategy;
+            chosenEl.innerHTML = `→ Playing <strong style="color:#fff">${chosen.uci}</strong> [${catLabel}] · WR ${(chosen.winrate * 100).toFixed(0)}% · <em style="font-style:normal;color:#b08a52;">${strat}</em>`;
+        }
+
+        const uci = chosen.uci;
+        const from = uci.substring(0, 2);
+        const to = uci.substring(2, 4);
+        const fromCoord = squareToViewportCoords(from, info.bRect, info.flipped);
+        const toCoord = squareToViewportCoords(to, info.bRect, info.flipped);
+
+        let totalDelay = SETTINGS.autoMoveDelay;
+        if (SETTINGS.autoMoveHumanize) totalDelay += reactionTimeSample() * 0.5;
+        if (totalDelay > 0) {
+            setStatus(`Auto-move in ${Math.round(totalDelay)}ms → ${uci}`, 'warn');
+            await sleep(totalDelay);
+        }
+
+        setStatus(`Auto-moving (${SETTINGS.autoMoveMode}) → ${uci}`, 'loading');
+        try {
+            if (SETTINGS.autoMoveMode === 'click') {
+                await simulateClickClick(fromCoord.x, fromCoord.y, toCoord.x, toCoord.y, fromCoord.cellW, fromCoord.cellH);
+            } else {
+                await simulateDragDrop(fromCoord.x, fromCoord.y, toCoord.x, toCoord.y, fromCoord.cellW, fromCoord.cellH);
+            }
+            setStatus(`Auto-move done → ${uci}`, 'ok');
+            showToast(`✓ Played ${uci}`, 'ok');
+        } catch (e) {
+            setStatus('Auto-move failed: ' + e.message, 'error');
+            showToast('✗ Auto-move failed', 'err');
+            console.error(e);
+        }
+    }
+
+    // ==================== OBSERVER ====================
+    let debounceTimer = null;
+    let lastKnownMoveCount = -1;
+    let lastKnownLastMove = '';
+    let pollTimer = null;
+    let moveListObserver = null;
+    let bodyObserver = null;
+
+    function getMoveSnapshot() {
+        const list = document.querySelector(OBSERVE_ROOT_SELECTOR);
+        if (!list) return { count: 0, last: '' };
+        const nodes = list.querySelectorAll('[data-node]');
+        const count = nodes.length;
+        let last = '';
+        if (count > 0) last = normalizeSan(extractSanFromNode(nodes[count - 1]));
+        return { count, last };
+    }
+
+    function scheduleAnalyze(reason) {
+        const auto = document.getElementById('cmh-auto-mode');
+        if (!auto || !auto.checked) return;
+        clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => {
+            const snap = getMoveSnapshot();
+            if (snap.count === lastKnownMoveCount && snap.last === lastKnownLastMove) return;
+            lastKnownMoveCount = snap.count;
+            lastKnownLastMove = snap.last;
+            // Retry detect kalau belum berhasil & belum override
+            if (!userOverrideSide && !detectedSide) {
+                tryDetectSide();
+            }
+            analyze();
+        }, DEBOUNCE_MS);
+    }
+
+    function attachMoveListObserver() {
+        const target = document.querySelector(OBSERVE_ROOT_SELECTOR);
+        if (!target) return false;
+        if (moveListObserver) moveListObserver.disconnect();
+        moveListObserver = new MutationObserver((mutations) => {
+            for (const m of mutations) {
+                if (m.type === 'childList') {
+                    for (const n of m.addedNodes) {
+                        if (n.nodeType === Node.ELEMENT_NODE) {
+                            if (n.hasAttribute && n.hasAttribute('data-node')) { scheduleAnalyze('node-added'); return; }
+                            if (n.querySelector && n.querySelector('[data-node]')) { scheduleAnalyze('node-added-nested'); return; }
+                        }
+                    }
+                    for (const n of m.removedNodes) {
+                        if (n.nodeType === Node.ELEMENT_NODE && n.hasAttribute && n.hasAttribute('data-node')) { scheduleAnalyze('node-removed'); return; }
+                    }
+                } else if (m.type === 'characterData') {
+                    const parent = m.target.parentElement;
+                    if (parent && parent.closest('[data-node]')) { scheduleAnalyze('text-changed'); return; }
+                }
+            }
+        });
+        moveListObserver.observe(target, { childList: true, subtree: true, characterData: true });
+        return true;
+    }
+
+    function attachBodyObserver() {
+        if (bodyObserver) bodyObserver.disconnect();
+        bodyObserver = new MutationObserver((mutations) => {
+            for (const m of mutations) {
+                for (const n of m.addedNodes) {
+                    if (n.nodeType === Node.ELEMENT_NODE) {
+                        if (n.matches && n.matches(OBSERVE_ROOT_SELECTOR)) {
+                            attachMoveListObserver();
+                            scheduleAnalyze('list-replaced');
+                            return;
+                        }
+                        if (n.querySelector && n.querySelector(OBSERVE_ROOT_SELECTOR)) {
+                            attachMoveListObserver();
+                            scheduleAnalyze('list-added');
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        bodyObserver.observe(document.body, { childList: true, subtree: true });
+    }
+
+    function startPolling() {
+        if (pollTimer) clearInterval(pollTimer);
+        pollTimer = setInterval(() => {
+            const auto = document.getElementById('cmh-auto-mode');
+            if (!auto || !auto.checked) return;
+            const snap = getMoveSnapshot();
+            if (snap.count !== lastKnownMoveCount || snap.last !== lastKnownLastMove) scheduleAnalyze('poll');
+            const current = document.querySelector(OBSERVE_ROOT_SELECTOR);
+            if (current && !moveListObserver) attachMoveListObserver();
+            // Retry detect kalau belum berhasil
+            if (!userOverrideSide && !detectedSide && detectionAttempts < MAX_DETECTION_ATTEMPTS) {
+                tryDetectSide();
+            }
+        }, 1000);
+    }
+
+    function startObservers() {
+        const tryAttach = () => {
+            if (attachMoveListObserver()) {
+                attachBodyObserver();
+                startPolling();
+                scheduleAnalyze('initial');
+                // Trigger detection saat move list ready
+                setTimeout(tryDetectSide, 300);
+                setTimeout(tryDetectSide, 1500);
+            } else {
+                setTimeout(tryAttach, 500);
+            }
+        };
+        tryAttach();
+    }
+    startObservers();
+
+    // ==================== INIT ====================
+    const savedOnLoad = loadState();
+    if (savedOnLoad) {
+        setStatus(`Loaded saved state: ${savedOnLoad.moves.length} moves.`, 'ok');
+    }
+
+})();
