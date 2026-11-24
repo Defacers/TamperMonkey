@@ -1,0 +1,937 @@
+// ==UserScript==
+// @name         Chess.com Best Move (v1.6 Responsive + Working AutoMove)
+// @namespace    http://tampermonkey.net/
+// @version      1.6
+// @description  Watch move list, analyze best move, draw arrow. Responsive panel, draggable on mobile, working auto-move simulation.
+// @author       You
+// @match        https://www.chess.com/play/*
+// @match        https://www.chess.com/game/*
+// @match        https://www.chess.com/analysis*
+// @require      https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.12.1/chess.min.js
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // ==================== CONFIG ====================
+    const STORAGE_KEY = 'chessBestMoveState';
+    const PANEL_POS_KEY = 'chessPanelPos';
+    const SETTINGS_KEY = 'chessPanelSettings';
+    const PANEL_COLLAPSED_KEY = 'chessPanelCollapsed';
+    const DEBOUNCE_MS = 600;
+    const OBSERVE_ROOT_SELECTOR = 'wc-simple-move-list';
+    const BOARD_SELECTOR = 'wc-chess-board';
+    const DEPTH = 12;
+
+    const IS_ANALYSIS = /\/analysis/.test(location.pathname);
+    const ALLOW_AUTO_OUTSIDE_ANALYSIS_KEY = 'chessAllowAutoOutsideAnalysis';
+
+    function isAutoOutsideAnalysisAllowed() {
+        return localStorage.getItem(ALLOW_AUTO_OUTSIDE_ANALYSIS_KEY) === '1';
+    }
+    function setAutoOutsideAnalysisAllowed(v) {
+        if (v) localStorage.setItem(ALLOW_AUTO_OUTSIDE_ANALYSIS_KEY, '1');
+        else localStorage.removeItem(ALLOW_AUTO_OUTSIDE_ANALYSIS_KEY);
+    }
+
+    // ==================== SETTINGS ====================
+    const DEFAULT_SETTINGS = {
+        bestColor: '#7fa650',
+        bestLineWidth: 10,
+        bestCircleRadius: 12,
+        bestOpacity: 0.95,
+        autoMoveDelay: 400,
+        autoMoveHumanize: true,
+        autoMoveMode: 'drag',
+    };
+
+    let SETTINGS = { ...DEFAULT_SETTINGS };
+    function loadSettings() {
+        try {
+            const raw = localStorage.getItem(SETTINGS_KEY);
+            if (!raw) return;
+            const s = JSON.parse(raw);
+            if (s && typeof s === 'object') SETTINGS = { ...DEFAULT_SETTINGS, ...s };
+        } catch (e) {}
+    }
+    function saveSettings() {
+        try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(SETTINGS)); } catch (e) {}
+    }
+    loadSettings();
+
+    // ==================== SAN NORMALIZER ====================
+    const FIGURINE_MAP = {
+        '♔': 'K', '♚': 'K', '♕': 'Q', '♛': 'Q',
+        '♖': 'R', '♜': 'R', '♗': 'B', '♝': 'B',
+        '♘': 'N', '♞': 'N'
+    };
+    function normalizeSan(raw) {
+        if (!raw) return '';
+        let s = raw.trim();
+        s = s.replace(/[♔♚♕♛♖♜♗♝♘♞]/g, ch => FIGURINE_MAP[ch] || ch);
+        s = s.replace(/\s+/g, '');
+        s = s.replace(/[!?]+/g, '');
+        s = s.replace(/[+#]/g, '');
+        s = s.replace(/[=\(]?([QRBNqrbn])\)?$/, (m, p) => '=' + p.toUpperCase());
+        s = s.replace(/^0-0-0$/, 'O-O-O').replace(/^0-0$/, 'O-O');
+        return s;
+    }
+    window.__normalizeSan = normalizeSan;
+
+    // ==================== STATE ====================
+    function loadState() {
+        try {
+            const raw = localStorage.getItem(STORAGE_KEY);
+            if (!raw) return null;
+            const s = JSON.parse(raw);
+            if (!s || !Array.isArray(s.moves) || typeof s.fen !== 'string') return null;
+            return s;
+        } catch (e) { return null; }
+    }
+    function saveState(state) {
+        try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch (e) {}
+    }
+    function clearState() { localStorage.removeItem(STORAGE_KEY); }
+
+    // ==================== PANEL ====================
+    function createPanel() {
+        if (!document.body) { setTimeout(createPanel, 500); return; }
+
+        const panel = document.createElement('div');
+        panel.id = 'my-chess-panel';
+        panel.style.cssText = `
+            position: fixed; top: 10px; left: 10px; z-index: 99999;
+            background: #262421; color: #ddd; padding: 0;
+            border-radius: 8px; font-family: sans-serif;
+            font-size: 13px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.5); border: 1px solid #444;
+            width: min(92vw, 330px); max-width: 92vw;
+            max-height: min(85vh, 720px);
+            display: flex; flex-direction: column;
+            user-select: none;
+            box-sizing: border-box;
+        `;
+
+        const saved = localStorage.getItem(PANEL_POS_KEY);
+        if (saved) {
+            try {
+                const { x, y } = JSON.parse(saved);
+                panel.style.left = x + 'px';
+                panel.style.top = y + 'px';
+            } catch (e) {}
+        }
+
+        const autoOutsideAllowed = isAutoOutsideAnalysisAllowed();
+        const autoMoveDisabled = !IS_ANALYSIS && !autoOutsideAllowed;
+        const autoMoveTitle = autoMoveDisabled
+            ? 'Auto-move only available on analysis pages. Enable override below to allow elsewhere.'
+            : 'Auto-move (play best move automatically)';
+
+        const collapsed = localStorage.getItem(PANEL_COLLAPSED_KEY) === '1';
+
+        panel.innerHTML = `
+            <div id="drag-header" style="
+                cursor: move; padding: 10px 12px; background: #1e1c1a;
+                border-radius: 8px 8px 0 0; font-weight: bold; color: #fff;
+                display: flex; justify-content: space-between; align-items: center;
+                touch-action: none; min-height: 24px;
+            ">
+                <span style="pointer-events:none;flex:1;">Best Move (Live)</span>
+                <span id="btn-collapse" style="font-size:16px;color:#aaa;padding:4px 8px;cursor:pointer;touch-action:manipulation;min-width:32px;min-height:32px;display:inline-flex;align-items:center;justify-content:center;">${collapsed ? '▸' : '▾'}</span>
+            </div>
+            <div id="panel-body" style="padding: 10px 14px; overflow-y: auto; flex: 1; -webkit-overflow-scrolling: touch; display:${collapsed ? 'none' : 'block'};">
+                <label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer;min-height:32px;">
+                    <input type="radio" name="side" value="w" checked style="width:18px;height:18px;flex-shrink:0;"> I play White
+                </label>
+                <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;cursor:pointer;min-height:32px;">
+                    <input type="radio" name="side" value="b" style="width:18px;height:18px;flex-shrink:0;"> I play Black
+                </label>
+                <label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer;font-size:12px;color:#aaa;min-height:32px;">
+                    <input type="checkbox" id="auto-mode" checked style="width:18px;height:18px;flex-shrink:0;"> Auto-analyze on change
+                </label>
+                <label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer;font-size:12px;color:${autoMoveDisabled ? '#555' : '#e6a23c'};min-height:32px;"
+                       title="${autoMoveTitle}">
+                    <input type="checkbox" id="auto-move" ${autoMoveDisabled ? 'disabled' : ''} style="width:18px;height:18px;flex-shrink:0;">
+                    <span>Auto-move best move ${autoMoveDisabled ? '(analysis only)' : ''}</span>
+                </label>
+                <label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer;font-size:11px;color:#c94;min-height:32px;"
+                       title="Allow auto-move outside analysis pages. Use at your own risk.">
+                    <input type="checkbox" id="allow-outside" ${autoOutsideAllowed ? 'checked' : ''} style="width:18px;height:18px;flex-shrink:0;">
+                    <span>⚠ Allow auto-move outside analysis</span>
+                </label>
+                <button id="btn-analyze" style="background:#7fa650;color:#fff;border:none;padding:10px 12px;border-radius:6px;cursor:pointer;width:100%;font-size:14px;min-height:44px;touch-action:manipulation;font-weight:bold;">
+                    Analyze Now
+                </button>
+                <button id="btn-reset" style="background:#a64d4d;color:#fff;border:none;padding:10px;border-radius:6px;cursor:pointer;width:100%;margin-top:6px;font-size:13px;min-height:40px;touch-action:manipulation;">
+                    Reset Saved State
+                </button>
+                <button id="btn-settings" style="background:#4a6fa5;color:#fff;border:none;padding:10px;border-radius:6px;cursor:pointer;width:100%;margin-top:6px;font-size:13px;min-height:40px;touch-action:manipulation;">
+                    ⚙ Settings (live)
+                </button>
+                <div id="settings-panel" style="display:none; margin-top:10px; padding:10px; background:#1e1c1a; border-radius:6px; font-size:12px;">
+                    <div style="font-weight:bold;color:#fff;margin-bottom:8px;">Arrow Settings</div>
+                    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+                        <label style="display:flex;align-items:center;gap:6px;">Color
+                            <input type="color" id="set-bestColor" value="${SETTINGS.bestColor}" style="width:48px;height:32px;padding:0;border:none;background:none;cursor:pointer;">
+                        </label>
+                    </div>
+                    <label style="display:block;margin-bottom:6px;">Width: <span id="lbl-bestW-width">${SETTINGS.bestLineWidth}</span>
+                        <input type="range" id="set-bestW-width" min="2" max="24" step="1" value="${SETTINGS.bestLineWidth}" style="width:100%;height:28px;">
+                    </label>
+                    <label style="display:block;margin-bottom:6px;">Circle: <span id="lbl-bestW-circle">${SETTINGS.bestCircleRadius}</span>
+                        <input type="range" id="set-bestW-circle" min="3" max="30" step="1" value="${SETTINGS.bestCircleRadius}" style="width:100%;height:28px;">
+                    </label>
+                    <label style="display:block;margin-bottom:8px;">Opacity: <span id="lbl-bestW-opacity">${SETTINGS.bestOpacity}</span>
+                        <input type="range" id="set-bestW-opacity" min="0.1" max="1" step="0.05" value="${SETTINGS.bestOpacity}" style="width:100%;height:28px;">
+                    </label>
+
+                    <div style="font-weight:bold;color:#fff;margin:10px 0 6px;">Auto-Move</div>
+                    <label style="display:block;margin-bottom:6px;">Mode:
+                        <select id="set-autoMode" style="width:100%;background:#333;color:#ddd;border:1px solid #555;border-radius:4px;padding:8px;min-height:36px;">
+                            <option value="drag" ${SETTINGS.autoMoveMode === 'drag' ? 'selected' : ''}>Drag & Drop</option>
+                            <option value="click" ${SETTINGS.autoMoveMode === 'click' ? 'selected' : ''}>Click-Click (2 taps)</option>
+                        </select>
+                    </label>
+                    <label style="display:block;margin-bottom:6px;">Delay: <span id="lbl-autoDelay">${SETTINGS.autoMoveDelay}</span>ms
+                        <input type="range" id="set-autoDelay" min="0" max="2000" step="50" value="${SETTINGS.autoMoveDelay}" style="width:100%;height:28px;">
+                    </label>
+                    <label style="display:flex;align-items:center;gap:8px;min-height:32px;">
+                        <input type="checkbox" id="set-autoHumanize" ${SETTINGS.autoMoveHumanize ? 'checked' : ''} style="width:18px;height:18px;">
+                        Humanize
+                    </label>
+                </div>
+                <div id="status" style="margin-top:10px;font-size:12px;color:#888;min-height:16px;word-break:break-word;">Initializing...</div>
+                <div id="best-move" style="
+                    margin-top:6px; font-size:22px; font-weight:bold; color:#7fa650;
+                    text-align:center; min-height:28px; letter-spacing:1px;
+                "></div>
+                <div id="state-info" style="margin-top:4px;font-size:11px;color:#666;min-height:14px;word-break:break-word;"></div>
+                <div id="debug-log" style="margin-top:4px;font-size:10px;color:#555;max-height:60px;overflow:auto;"></div>
+            </div>
+        `;
+        document.body.appendChild(panel);
+
+        // ==================== DRAG (MOUSE + TOUCH + POINTER) ====================
+        const header = document.getElementById('drag-header');
+        let dragging = false, offsetX = 0, offsetY = 0, activePointerId = null;
+
+        function getPointerPos(e) {
+            if (e.touches && e.touches.length) return { x: e.touches[0].clientX, y: e.touches[0].clientY };
+            if (e.changedTouches && e.changedTouches.length) return { x: e.changedTouches[0].clientX, y: e.changedTouches[0].clientY };
+            return { x: e.clientX, y: e.clientY };
+        }
+
+        function startDrag(e) {
+            if (e.target && (e.target.id === 'btn-collapse')) return;
+            dragging = true;
+            const p = getPointerPos(e);
+            const rect = panel.getBoundingClientRect();
+            offsetX = Math.max(0, Math.min(p.x - rect.left, rect.width));
+            offsetY = Math.max(0, Math.min(p.y - rect.top, rect.height));
+            if (e.pointerId !== undefined) activePointerId = e.pointerId;
+            if (e.cancelable) e.preventDefault();
+        }
+
+        function moveDrag(e) {
+            if (!dragging) return;
+            if (activePointerId !== null && e.pointerId !== undefined && e.pointerId !== activePointerId) return;
+            const p = getPointerPos(e);
+            let x = p.x - offsetX;
+            let y = p.y - offsetY;
+            const maxX = window.innerWidth - panel.offsetWidth;
+            const maxY = window.innerHeight - panel.offsetHeight;
+            x = Math.max(0, Math.min(x, maxX));
+            y = Math.max(0, Math.min(y, maxY));
+            panel.style.left = x + 'px';
+            panel.style.top = y + 'px';
+            if (e.cancelable) e.preventDefault();
+        }
+
+        function endDrag(e) {
+            if (!dragging) return;
+            dragging = false;
+            activePointerId = null;
+            try {
+                localStorage.setItem(PANEL_POS_KEY, JSON.stringify({
+                    x: parseInt(panel.style.left, 10) || 10,
+                    y: parseInt(panel.style.top, 10) || 10
+                }));
+            } catch (err) {}
+            if (e && e.cancelable) e.preventDefault();
+        }
+
+        if (window.PointerEvent) {
+            header.addEventListener('pointerdown', startDrag, { passive: false });
+            document.addEventListener('pointermove', moveDrag, { passive: false });
+            document.addEventListener('pointerup', endDrag, { passive: false });
+            document.addEventListener('pointercancel', endDrag, { passive: false });
+        } else {
+            header.addEventListener('mousedown', startDrag);
+            document.addEventListener('mousemove', moveDrag);
+            document.addEventListener('mouseup', endDrag);
+            header.addEventListener('touchstart', startDrag, { passive: false });
+            document.addEventListener('touchmove', moveDrag, { passive: false });
+            document.addEventListener('touchend', endDrag, { passive: false });
+            document.addEventListener('touchcancel', endDrag, { passive: false });
+        }
+
+        // Collapse toggle
+        document.getElementById('btn-collapse').addEventListener('click', (e) => {
+            e.stopPropagation();
+            const body = document.getElementById('panel-body');
+            const isCollapsed = body.style.display === 'none';
+            body.style.display = isCollapsed ? 'block' : 'none';
+            e.target.textContent = isCollapsed ? '▾' : '▸';
+            localStorage.setItem(PANEL_COLLAPSED_KEY, isCollapsed ? '0' : '1');
+        });
+
+        // Clamp posisi ke viewport
+        function clampPanelToViewport() {
+            const rect = panel.getBoundingClientRect();
+            let x = parseInt(panel.style.left, 10) || 10;
+            let y = parseInt(panel.style.top, 10) || 10;
+            const maxX = Math.max(0, window.innerWidth - rect.width);
+            const maxY = Math.max(0, window.innerHeight - rect.height);
+            x = Math.max(0, Math.min(x, maxX));
+            y = Math.max(0, Math.min(y, maxY));
+            panel.style.left = x + 'px';
+            panel.style.top = y + 'px';
+        }
+        clampPanelToViewport();
+        window.addEventListener('resize', clampPanelToViewport);
+        window.addEventListener('orientationchange', () => setTimeout(clampPanelToViewport, 200));
+
+        bindLiveSettings();
+    }
+    createPanel();
+
+    function bindLiveSettings() {
+        const on = (id, evt, fn) => {
+            const el = document.getElementById(id);
+            if (el) el.addEventListener(evt, fn);
+        };
+        on('set-bestColor', 'input', e => { SETTINGS.bestColor = e.target.value; saveSettings(); redrawBestMove(); });
+
+        const bindRange = (id, labelId, key, isInt, after) => {
+            const el = document.getElementById(id);
+            const lbl = document.getElementById(labelId);
+            if (!el) return;
+            el.addEventListener('input', e => {
+                const v = isInt ? parseInt(e.target.value, 10) : parseFloat(e.target.value);
+                SETTINGS[key] = v;
+                if (lbl) lbl.textContent = v;
+                saveSettings();
+                if (after) after();
+            });
+        };
+        bindRange('set-bestW-width', 'lbl-bestW-width', 'bestLineWidth', false, redrawBestMove);
+        bindRange('set-bestW-circle', 'lbl-bestW-circle', 'bestCircleRadius', false, redrawBestMove);
+        bindRange('set-bestW-opacity', 'lbl-bestW-opacity', 'bestOpacity', false, redrawBestMove);
+        bindRange('set-autoDelay', 'lbl-autoDelay', 'autoMoveDelay', true);
+
+        on('set-autoHumanize', 'change', e => { SETTINGS.autoMoveHumanize = e.target.checked; saveSettings(); });
+        on('set-autoMode', 'change', e => { SETTINGS.autoMoveMode = e.target.value; saveSettings(); });
+    }
+
+    // ==================== ENGINE ====================
+    let sfWorker = null;
+    const statusEl = () => document.getElementById('status');
+    const bestMoveEl = () => document.getElementById('best-move');
+    const stateInfoEl = () => document.getElementById('state-info');
+    const debugEl = () => document.getElementById('debug-log');
+
+    function debug(msg) {
+        const el = debugEl();
+        if (el) {
+            const line = document.createElement('div');
+            line.textContent = msg;
+            el.appendChild(line);
+            if (el.childNodes.length > 8) el.removeChild(el.firstChild);
+            el.scrollTop = el.scrollHeight;
+        }
+        console.log('[ChessHelper]', msg);
+    }
+
+    async function initEngine() {
+        try {
+            const resp = await fetch('https://cdnjs.cloudflare.com/ajax/libs/stockfish.js/10.0.1/stockfish.js');
+            if (!resp.ok) throw new Error('HTTP ' + resp.status);
+            const code = await resp.text();
+            sfWorker = new Worker(URL.createObjectURL(new Blob([code], { type: 'application/javascript' })));
+            statusEl().textContent = 'Engine ready';
+        } catch (e) {
+            statusEl().textContent = 'Engine load failed: ' + e.message;
+        }
+    }
+    initEngine();
+
+    // ==================== MOVE LIST EXTRACTION ====================
+    function extractSanFromNode(node) {
+        let san = '';
+        for (const child of node.childNodes) {
+            if (child.nodeType === Node.TEXT_NODE) {
+                san += child.textContent;
+            } else if (child.nodeType === Node.ELEMENT_NODE) {
+                if (child.hasAttribute('data-move-list-el')) continue;
+                if (child.classList && child.classList.contains('timestamp')) continue;
+                const fig = child.getAttribute('data-figurine');
+                if (fig) san += fig;
+                else san += extractSanFromNode(child);
+            }
+        }
+        return san;
+    }
+
+    function readMovesFromList() {
+        const list = document.querySelector(OBSERVE_ROOT_SELECTOR);
+        if (!list) return null;
+        const moves = [];
+        list.querySelectorAll('[data-node]').forEach(node => {
+            const raw = extractSanFromNode(node);
+            const normalized = normalizeSan(raw);
+            if (normalized) moves.push(normalized);
+        });
+        return moves.length ? moves : null;
+    }
+
+    // ==================== POSITION BUILDING ====================
+    function rebuildFromSaved(saved) {
+        const chess = new Chess();
+        for (const san of saved.moves) if (!chess.move(san)) break;
+        return chess;
+    }
+
+    function buildPosition() {
+        const domMoves = readMovesFromList();
+        const saved = loadState();
+
+        if (!domMoves && !saved) return null;
+        if (!domMoves) {
+            stateInfoEl().textContent = `Using saved: ${saved.moves.length} moves`;
+            return { chess: rebuildFromSaved(saved), moves: saved.moves };
+        }
+        if (!saved) {
+            const chess = new Chess();
+            const applied = [];
+            for (const san of domMoves) {
+                if (!chess.move(san)) { debug(`Parse failed: ${san}`); break; }
+                applied.push(san);
+            }
+            saveState({ moves: applied, fen: chess.fen(), ts: Date.now() });
+            stateInfoEl().textContent = `New: ${applied.length} moves`;
+            return { chess, moves: applied };
+        }
+
+        let common = 0;
+        const minLen = Math.min(domMoves.length, saved.moves.length);
+        for (let i = 0; i < minLen; i++) {
+            if (domMoves[i] === saved.moves[i]) common++;
+            else break;
+        }
+
+        if (common === saved.moves.length && domMoves.length > saved.moves.length) {
+            const chess = new Chess(saved.fen);
+            const applied = saved.moves.slice();
+            for (let i = saved.moves.length; i < domMoves.length; i++) {
+                if (!chess.move(domMoves[i])) { debug(`Continue parse failed: ${domMoves[i]}`); break; }
+                applied.push(domMoves[i]);
+            }
+            saveState({ moves: applied, fen: chess.fen(), ts: Date.now() });
+            stateInfoEl().textContent = `Continued: +${applied.length - saved.moves.length} moves`;
+            return { chess, moves: applied };
+        }
+
+        if (common === domMoves.length && common === saved.moves.length) {
+            stateInfoEl().textContent = `Same as saved: ${saved.moves.length} moves`;
+            return { chess: rebuildFromSaved(saved), moves: saved.moves };
+        }
+
+        if (common === domMoves.length && domMoves.length < saved.moves.length) {
+            stateInfoEl().textContent = `Partial view, using saved: ${saved.moves.length} moves`;
+            return { chess: rebuildFromSaved(saved), moves: saved.moves };
+        }
+
+        const chess = new Chess();
+        const applied = [];
+        for (const san of domMoves) {
+            if (!chess.move(san)) { debug(`Rebuild parse failed: ${san}`); break; }
+            applied.push(san);
+        }
+        saveState({ moves: applied, fen: chess.fen(), ts: Date.now() });
+        stateInfoEl().textContent = `Rebuilt: ${applied.length} moves`;
+        return { chess, moves: applied };
+    }
+
+    // ==================== ANALYZE ====================
+    let analyzing = false;
+    let lastBestMove = null;
+    let lastAnalyzedFen = null;
+
+    function analyze() {
+        if (analyzing) return;
+        if (!sfWorker) { statusEl().textContent = 'Engine not ready'; return; }
+        if (typeof Chess === 'undefined') { statusEl().textContent = 'chess.js not loaded'; return; }
+
+        const side = document.querySelector('input[name="side"]:checked').value;
+        const result = buildPosition();
+        if (!result) { statusEl().textContent = 'No moves to analyze'; return; }
+
+        const { chess, moves } = result;
+        if (chess.turn() !== side) {
+            statusEl().textContent = `It is ${chess.turn() === 'w' ? 'White' : 'Black'}'s turn`;
+            bestMoveEl().textContent = '';
+            clearOverlay();
+            return;
+        }
+
+        const fen = chess.fen();
+        if (fen === lastAnalyzedFen && lastBestMove) return;
+
+        analyzing = true;
+        statusEl().textContent = `Analyzing (${moves.length} moves)...`;
+        bestMoveEl().textContent = '';
+        sfWorker.postMessage('position fen ' + fen);
+        sfWorker.postMessage('go depth ' + DEPTH);
+
+        sfWorker.onmessage = function (event) {
+            const line = event.data;
+            if (typeof line === 'string' && line.startsWith('bestmove')) {
+                analyzing = false;
+                const move = line.split(' ')[1];
+                if (move && move !== '(none)') {
+                    statusEl().textContent = 'Done';
+                    bestMoveEl().textContent = move;
+                    lastBestMove = move;
+                    lastAnalyzedFen = fen;
+                    drawBestMoveArrow(move);
+                    maybeAutoMove(move, side);
+                } else {
+                    statusEl().textContent = 'No move available';
+                }
+            }
+        };
+    }
+
+    // ==================== ARROW DRAWING ====================
+    function getBoardInfo() {
+        const board = document.querySelector(BOARD_SELECTOR);
+        if (!board) return null;
+        const bRect = board.getBoundingClientRect();
+        if (bRect.width < 10) return null;
+        return { board, flipped: board.classList.contains('flipped'), bRect };
+    }
+
+    function squareToViewportCoords(square, bRect, flipped) {
+        const file = square.charCodeAt(0) - 97;
+        const rank = parseInt(square[1], 10) - 1;
+        const cellW = bRect.width / 8;
+        const cellH = bRect.height / 8;
+        let col, row;
+        if (!flipped) { col = file; row = 7 - rank; }
+        else { col = 7 - file; row = rank; }
+        return {
+            x: bRect.left + col * cellW + cellW / 2,
+            y: bRect.top + row * cellH + cellH / 2
+        };
+    }
+
+    // ==================== OVERLAY ====================
+    let overlaySvg = null;
+    function ensureOverlaySvg() {
+        if (!overlaySvg || !overlaySvg.parentNode) {
+            overlaySvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+            overlaySvg.setAttribute('data-chess-overlay', 'best');
+            overlaySvg.style.cssText = `
+                position: fixed; top: 0; left: 0;
+                width: 100vw; height: 100vh;
+                pointer-events: none;
+                z-index: 2147483647;
+                overflow: visible;
+            `;
+            document.body.appendChild(overlaySvg);
+        }
+        return overlaySvg;
+    }
+
+    function clearOverlay() {
+        if (overlaySvg) while (overlaySvg.firstChild) overlaySvg.removeChild(overlaySvg.firstChild);
+    }
+
+    function drawBestMoveArrow(moveStr) {
+        clearOverlay();
+        const info = getBoardInfo();
+        if (!info) return;
+        const svg = ensureOverlaySvg();
+        const from = moveStr.substring(0, 2);
+        const to = moveStr.substring(2, 4);
+        if (from.length !== 2 || to.length !== 2) return;
+
+        const fromCoord = squareToViewportCoords(from, info.bRect, info.flipped);
+        const toCoord = squareToViewportCoords(to, info.bRect, info.flipped);
+
+        const color = SETTINGS.bestColor;
+        const width = SETTINGS.bestLineWidth;
+        const opacity = SETTINGS.bestOpacity;
+
+        const glowId = 'bestGlow_' + Math.random().toString(36).slice(2);
+        const defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
+        const filter = document.createElementNS('http://www.w3.org/2000/svg', 'filter');
+        filter.setAttribute('id', glowId);
+        filter.setAttribute('x', '-50%'); filter.setAttribute('y', '-50%');
+        filter.setAttribute('width', '200%'); filter.setAttribute('height', '200%');
+        const blur = document.createElementNS('http://www.w3.org/2000/svg', 'feGaussianBlur');
+        blur.setAttribute('stdDeviation', '2.5');
+        blur.setAttribute('result', 'coloredBlur');
+        const merge = document.createElementNS('http://www.w3.org/2000/svg', 'feMerge');
+        const m1 = document.createElementNS('http://www.w3.org/2000/svg', 'feMergeNode');
+        m1.setAttribute('in', 'coloredBlur');
+        const m2 = document.createElementNS('http://www.w3.org/2000/svg', 'feMergeNode');
+        m2.setAttribute('in', 'SourceGraphic');
+        merge.appendChild(m1); merge.appendChild(m2);
+        filter.appendChild(blur); filter.appendChild(merge);
+        defs.appendChild(filter);
+        svg.appendChild(defs);
+
+        const dx = toCoord.x - fromCoord.x;
+        const dy = toCoord.y - fromCoord.y;
+        const angle = Math.atan2(dy, dx);
+        const halfW = width / 2;
+        const offsetX = halfW * Math.sin(angle);
+        const offsetY = halfW * Math.cos(angle);
+
+        const polygon = document.createElementNS('http://www.w3.org/2000/svg', 'polygon');
+        polygon.setAttribute('points', `
+            ${fromCoord.x - offsetX},${fromCoord.y + offsetY}
+            ${toCoord.x - offsetX},${toCoord.y + offsetY}
+            ${toCoord.x + offsetX},${toCoord.y - offsetY}
+            ${fromCoord.x + offsetX},${fromCoord.y - offsetY}
+        `);
+        polygon.setAttribute('fill', color);
+        polygon.setAttribute('opacity', String(opacity));
+        polygon.setAttribute('filter', `url(#${glowId})`);
+        svg.appendChild(polygon);
+
+        const circleStart = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+        circleStart.setAttribute('cx', String(fromCoord.x));
+        circleStart.setAttribute('cy', String(fromCoord.y));
+        circleStart.setAttribute('r', String(halfW));
+        circleStart.setAttribute('fill', color);
+        circleStart.setAttribute('opacity', String(opacity));
+        circleStart.setAttribute('filter', `url(#${glowId})`);
+        svg.appendChild(circleStart);
+
+        const circleEnd = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+        circleEnd.setAttribute('cx', String(toCoord.x));
+        circleEnd.setAttribute('cy', String(toCoord.y));
+        circleEnd.setAttribute('r', String(SETTINGS.bestCircleRadius));
+        circleEnd.setAttribute('fill', color);
+        circleEnd.setAttribute('opacity', String(opacity));
+        circleEnd.setAttribute('filter', `url(#${glowId})`);
+        svg.appendChild(circleEnd);
+    }
+
+    function redrawBestMove() { if (lastBestMove) drawBestMoveArrow(lastBestMove); }
+
+    // ==================== AUTO MOVE (ROBUST) ====================
+    function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+    // Dispatch pointer event yang benar (chess.com modern pakai PointerEvent)
+    function firePointer(target, type, x, y, opts = {}) {
+        const base = {
+            bubbles: true, cancelable: true, composed: true,
+            clientX: x, clientY: y, screenX: x, screenY: y,
+            button: 0, buttons: type === 'pointerdown' || type === 'pointermove' ? 1 : 0,
+            pointerId: 1, pointerType: 'mouse', isPrimary: true,
+            view: window, ...opts
+        };
+        try {
+            target.dispatchEvent(new PointerEvent(type, base));
+        } catch (e) {
+            target.dispatchEvent(new MouseEvent(type.replace('pointer', 'mouse'), base));
+        }
+    }
+    function fireMouse(target, type, x, y) {
+        target.dispatchEvent(new MouseEvent(type, {
+            bubbles: true, cancelable: true, composed: true,
+            clientX: x, clientY: y, screenX: x, screenY: y,
+            button: 0, buttons: type === 'mousedown' || type === 'mousemove' ? 1 : 0,
+            view: window
+        }));
+    }
+
+    function findBoardPieceAt(x, y) {
+        // Cari elemen piece / square di bawah koordinat
+        let el = document.elementFromPoint(x, y);
+        if (!el) return null;
+        return el;
+    }
+
+    async function simulateDragDrop(startX, startY, endX, endY) {
+        const humanize = SETTINGS.autoMoveHumanize;
+        const jitter = () => humanize ? (Math.random() - 0.5) * 4 : 0;
+
+        const startEl = findBoardPieceAt(startX, startY);
+        if (!startEl) throw new Error('no element at start');
+
+        // 1) pointerdown di square asal
+        firePointer(startEl, 'pointerdown', startX + jitter(), startY + jitter());
+        fireMouse(startEl, 'mousedown', startX + jitter(), startY + jitter());
+        await sleep(humanize ? 40 + Math.random() * 40 : 20);
+
+        // 2) gerakan bertahap dengan curve (untuk humanize)
+        const steps = humanize ? 14 + Math.floor(Math.random() * 6) : 10;
+        const midX = (startX + endX) / 2 + (humanize ? (Math.random() - 0.5) * 10 : 0);
+        const midY = (startY + endY) / 2 + (humanize ? (Math.random() - 0.5) * 10 : 0);
+
+        for (let i = 1; i <= steps; i++) {
+            const t = i / steps;
+            // Quadratic bezier
+            const x = (1 - t) * (1 - t) * startX + 2 * (1 - t) * t * midX + t * t * endX;
+            const y = (1 - t) * (1 - t) * startY + 2 * (1 - t) * t * midY + t * t * endY;
+
+            // target element di titik ini (penting: chess.com listener bisa di board)
+            const target = document.elementFromPoint(x, y) || startEl;
+            firePointer(target, 'pointermove', x + jitter(), y + jitter());
+            fireMouse(target, 'mousemove', x + jitter(), y + jitter());
+            await sleep(humanize ? 12 + Math.random() * 15 : 8);
+        }
+
+        await sleep(humanize ? 50 + Math.random() * 60 : 25);
+
+        // 3) pointerup di target
+        const endTarget = document.elementFromPoint(endX, endY) || startEl;
+        firePointer(endTarget, 'pointerup', endX + jitter(), endY + jitter());
+        fireMouse(endTarget, 'mouseup', endX + jitter(), endY + jitter());
+        // click tambahan (beberapa UI butuh click setelah drop)
+        fireMouse(endTarget, 'click', endX + jitter(), endY + jitter());
+    }
+
+    async function simulateClickClick(startX, startY, endX, endY) {
+        const humanize = SETTINGS.autoMoveHumanize;
+        const jitter = () => humanize ? (Math.random() - 0.5) * 3 : 0;
+
+        const startEl = findBoardPieceAt(startX, startY);
+        if (!startEl) throw new Error('no element at start');
+
+        // Klik pertama (select piece)
+        firePointer(startEl, 'pointerdown', startX + jitter(), startY + jitter());
+        fireMouse(startEl, 'mousedown', startX + jitter(), startY + jitter());
+        await sleep(humanize ? 30 + Math.random() * 30 : 15);
+        firePointer(startEl, 'pointerup', startX + jitter(), startY + jitter());
+        fireMouse(startEl, 'mouseup', startX + jitter(), startY + jitter());
+        fireMouse(startEl, 'click', startX + jitter(), startY + jitter());
+
+        await sleep(humanize ? 120 + Math.random() * 100 : 60);
+
+        // Klik kedua (drop di target)
+        const endEl = document.elementFromPoint(endX, endY) || startEl;
+        firePointer(endEl, 'pointerdown', endX + jitter(), endY + jitter());
+        fireMouse(endEl, 'mousedown', endX + jitter(), endY + jitter());
+        await sleep(humanize ? 30 + Math.random() * 30 : 15);
+        firePointer(endEl, 'pointerup', endX + jitter(), endY + jitter());
+        fireMouse(endEl, 'mouseup', endX + jitter(), endY + jitter());
+        fireMouse(endEl, 'click', endX + jitter(), endY + jitter());
+    }
+
+    async function maybeAutoMove(uci, side) {
+        const autoMoveBox = document.getElementById('auto-move');
+        if (!autoMoveBox || !autoMoveBox.checked) return;
+        if (!IS_ANALYSIS && !isAutoOutsideAnalysisAllowed()) return;
+
+        const info = getBoardInfo();
+        if (!info) return;
+
+        const from = uci.substring(0, 2);
+        const to = uci.substring(2, 4);
+        const fromCoord = squareToViewportCoords(from, info.bRect, info.flipped);
+        const toCoord = squareToViewportCoords(to, info.bRect, info.flipped);
+
+        const delay = Math.max(0, SETTINGS.autoMoveDelay);
+        if (delay > 0) {
+            statusEl().textContent = `Auto-move in ${delay}ms...`;
+            await sleep(delay);
+        }
+
+        statusEl().textContent = `Auto-moving (${SETTINGS.autoMoveMode})...`;
+        try {
+            if (SETTINGS.autoMoveMode === 'click') {
+                await simulateClickClick(fromCoord.x, fromCoord.y, toCoord.x, toCoord.y);
+            } else {
+                await simulateDragDrop(fromCoord.x, fromCoord.y, toCoord.x, toCoord.y);
+            }
+            statusEl().textContent = 'Auto-move done';
+        } catch (e) {
+            statusEl().textContent = 'Auto-move failed: ' + e.message;
+            console.error(e);
+        }
+    }
+
+    // ==================== OBSERVER ====================
+    let debounceTimer = null;
+    let lastKnownMoveCount = -1;
+    let lastKnownLastMove = '';
+    let pollTimer = null;
+    let moveListObserver = null;
+    let bodyObserver = null;
+
+    function getMoveSnapshot() {
+        const list = document.querySelector(OBSERVE_ROOT_SELECTOR);
+        if (!list) return { count: 0, last: '' };
+        const nodes = list.querySelectorAll('[data-node]');
+        const count = nodes.length;
+        let last = '';
+        if (count > 0) last = normalizeSan(extractSanFromNode(nodes[count - 1]));
+        return { count, last };
+    }
+
+    function scheduleAnalyze(reason) {
+        const auto = document.getElementById('auto-mode');
+        if (!auto || !auto.checked) return;
+        clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => {
+            const snap = getMoveSnapshot();
+            if (snap.count === lastKnownMoveCount && snap.last === lastKnownLastMove) return;
+            lastKnownMoveCount = snap.count;
+            lastKnownLastMove = snap.last;
+            debug(`Analyze triggered (${reason}), moves=${snap.count}`);
+            analyze();
+        }, DEBOUNCE_MS);
+    }
+
+    function attachMoveListObserver() {
+        const target = document.querySelector(OBSERVE_ROOT_SELECTOR);
+        if (!target) return false;
+        if (moveListObserver) moveListObserver.disconnect();
+        moveListObserver = new MutationObserver((mutations) => {
+            for (const m of mutations) {
+                if (m.type === 'childList') {
+                    for (const n of m.addedNodes) {
+                        if (n.nodeType === Node.ELEMENT_NODE) {
+                            if (n.hasAttribute && n.hasAttribute('data-node')) { scheduleAnalyze('node-added'); return; }
+                            if (n.querySelector && n.querySelector('[data-node]')) { scheduleAnalyze('node-added-nested'); return; }
+                        }
+                    }
+                    for (const n of m.removedNodes) {
+                        if (n.nodeType === Node.ELEMENT_NODE && n.hasAttribute && n.hasAttribute('data-node')) { scheduleAnalyze('node-removed'); return; }
+                    }
+                } else if (m.type === 'characterData') {
+                    const parent = m.target.parentElement;
+                    if (parent && parent.closest('[data-node]')) { scheduleAnalyze('text-changed'); return; }
+                }
+            }
+        });
+        moveListObserver.observe(target, { childList: true, subtree: true, characterData: true });
+        debug('Move list observer attached');
+        return true;
+    }
+
+    function attachBodyObserver() {
+        if (bodyObserver) bodyObserver.disconnect();
+        bodyObserver = new MutationObserver((mutations) => {
+            for (const m of mutations) {
+                for (const n of m.addedNodes) {
+                    if (n.nodeType === Node.ELEMENT_NODE) {
+                        if (n.matches && n.matches(OBSERVE_ROOT_SELECTOR)) {
+                            debug('Move list element replaced');
+                            attachMoveListObserver();
+                            scheduleAnalyze('list-replaced');
+                            return;
+                        }
+                        if (n.querySelector && n.querySelector(OBSERVE_ROOT_SELECTOR)) {
+                            debug('Move list element added (nested)');
+                            attachMoveListObserver();
+                            scheduleAnalyze('list-added');
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        bodyObserver.observe(document.body, { childList: true, subtree: true });
+    }
+
+    function startPolling() {
+        if (pollTimer) clearInterval(pollTimer);
+        pollTimer = setInterval(() => {
+            const auto = document.getElementById('auto-mode');
+            if (!auto || !auto.checked) return;
+            const snap = getMoveSnapshot();
+            if (snap.count !== lastKnownMoveCount || snap.last !== lastKnownLastMove) scheduleAnalyze('poll');
+            const current = document.querySelector(OBSERVE_ROOT_SELECTOR);
+            if (current && !moveListObserver) attachMoveListObserver();
+        }, 1000);
+    }
+
+    function startObservers() {
+        const tryAttach = () => {
+            if (attachMoveListObserver()) {
+                attachBodyObserver();
+                startPolling();
+                statusEl().textContent = 'Watching move list...';
+                scheduleAnalyze('initial');
+            } else {
+                setTimeout(tryAttach, 500);
+            }
+        };
+        tryAttach();
+    }
+    startObservers();
+
+    // ==================== BIND BUTTONS ====================
+    document.addEventListener('click', function (e) {
+        if (!e.target) return;
+        if (e.target.id === 'btn-analyze') analyze();
+        if (e.target.id === 'btn-reset') {
+            clearState();
+            statusEl().textContent = 'State cleared';
+            stateInfoEl().textContent = '';
+            bestMoveEl().textContent = '';
+            debugEl().innerHTML = '';
+            lastKnownMoveCount = -1;
+            lastKnownLastMove = '';
+            lastAnalyzedFen = null;
+            lastBestMove = null;
+            clearOverlay();
+        }
+        if (e.target.id === 'btn-settings') {
+            const sp = document.getElementById('settings-panel');
+            sp.style.display = sp.style.display === 'none' ? 'block' : 'none';
+        }
+    });
+
+    document.addEventListener('change', function (e) {
+        if (!e.target) return;
+        if (e.target.id === 'allow-outside') {
+            if (e.target.checked && !IS_ANALYSIS) {
+                const ok = confirm(
+                    'PERINGATAN: Anda mengaktifkan auto-move di luar halaman analisis.\n\n' +
+                    'Jika digunakan di permainan berperingkat, akun Anda bisa diblokir permanen oleh Chess.com.\n\n' +
+                    'Gunakan hanya untuk permainan kasual, bot, atau latihan.\n\n' +
+                    'Lanjutkan?'
+                );
+                if (!ok) { e.target.checked = false; return; }
+            }
+            setAutoOutsideAnalysisAllowed(e.target.checked);
+            const autoMove = document.getElementById('auto-move');
+            if (autoMove) {
+                if (e.target.checked) {
+                    autoMove.disabled = false;
+                    statusEl().textContent = 'Override enabled — auto-move available everywhere';
+                } else if (!IS_ANALYSIS) {
+                    autoMove.disabled = true;
+                    autoMove.checked = false;
+                    statusEl().textContent = 'Override disabled — auto-move restricted to analysis';
+                }
+            }
+        }
+    });
+
+    // ==================== INIT ====================
+    const savedOnLoad = loadState();
+    if (savedOnLoad) {
+        stateInfoEl().textContent = `Saved: ${savedOnLoad.moves.length} moves (${new Date(savedOnLoad.ts).toLocaleTimeString()})`;
+    }
+
+})();
