@@ -1,0 +1,230 @@
+// ==UserScript==
+// @name         Erablue Login – Final Perfect UI (v7.0 Left-Aligned)
+// @namespace    era.tamper
+// @version      7.0
+// @description  Rata kiri, Floating Label, 100% Stealth & Anti-Flicker
+// @match        https://authkey.erablue.id/*
+// @run-at       document-start
+// @grant        none
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const css = `
+    /* =========================================
+       STEALTH MODE (Sembunyikan total elemen asli)
+       ========================================= */
+    #manual-otp-group .otp-digit-wrapper,
+    #manual-otp-group > .pf-v5-c-form__group-label,
+    .pf-v5-c-form__group:has(#username) > .pf-v5-c-form__group-label {
+        display: none !important;
+        opacity: 0 !important;
+        visibility: hidden !important;
+        pointer-events: none !important;
+    }
+
+    .pf-v5-c-form__group:has(#username) .pf-v5-c-form-control {
+        background: transparent !important;
+        border: none !important;
+        padding: 0 !important;
+        min-height: 0 !important;
+    }
+    .pf-v5-c-form__group:has(#username) .pf-v5-c-form-control::before,
+    .pf-v5-c-form__group:has(#username) .pf-v5-c-form-control::after {
+        display: none !important;
+    }
+
+    /* =========================================
+       FLOATING LABEL & INPUT (Left-Aligned)
+       ========================================= */
+    .era-float {
+        position: relative;
+        margin: 12px 0 20px;
+        width: 100%;
+    }
+
+    /* Kotak Input */
+    .era-float input {
+        width: 100%;
+        height: 56px;
+        padding: 0 16px; /* Simetris atas-bawah */
+        font-size: 16px;
+        font-weight: 500;
+        font-family: inherit;
+        border: 1px solid var(--dmx-line, #d3ddef);
+        border-radius: 10px;
+        background: #fff;
+        color: var(--dmx-navy, #0b1f4d);
+        outline: none;
+        box-sizing: border-box;
+        transition: border-color .2s ease, box-shadow .2s ease;
+
+        /* KUNCI: Teks Rata Kiri */
+        text-align: left;
+    }
+
+    #era-otp-single {
+        letter-spacing: 2px;
+    }
+
+    .era-float input::placeholder { color: transparent; }
+
+    /* Label State: Diam (Tengah kotak secara vertikal, tapi rata kiri) */
+    .era-float label {
+        position: absolute;
+        left: 16px; /* Sejajar dengan padding input */
+        top: 28px; /* 56px / 2 = 28px */
+        transform: translateY(-50%);
+        color: var(--dmx-muted, #5b6b85);
+        font-size: 16px;
+        font-weight: 400;
+        pointer-events: none;
+        transition: all .2s ease;
+        padding: 0;
+        background: transparent;
+    }
+
+    /* Label State: Fokus / Terisi (Naik ke Outline) */
+    .era-float input:focus + label,
+    .era-float input:not(:placeholder-shown) + label {
+        top: 0;
+        left: 12px;
+        transform: translateY(-50%) scale(0.85);
+        transform-origin: left top;
+        color: var(--dmx-blue, #0b5ed7);
+        font-weight: 500;
+        background: #f4f7fd;
+        padding: 0 4px; /* Padding horizontal saat naik */
+        border-radius: 4px;
+    }
+
+    /* Fokus Input */
+    .era-float input:focus {
+        border-color: var(--dmx-blue, #0b5ed7);
+        box-shadow: 0 0 0 3px rgba(11,94,215,.15);
+    }
+
+    /* Error State */
+    .era-float.era-error input {
+        border-color: var(--dmx-error, #c9190b);
+        box-shadow: 0 0 0 3px rgba(201,25,11,.12);
+    }
+    .era-float.era-error label {
+        color: var(--dmx-error, #c9190b);
+    }
+    `;
+
+    const style = document.createElement('style');
+    style.textContent = css;
+    (document.head || document.documentElement).appendChild(style);
+
+    const $ = (sel, root = document) => root.querySelector(sel);
+    const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+
+    function setupFloating(input, labelText) {
+        if (!input.getAttribute('placeholder')) input.setAttribute('placeholder', ' ');
+
+        const wrap = document.createElement('div');
+        wrap.className = 'era-float';
+
+        input.parentNode.insertBefore(wrap, input);
+        wrap.appendChild(input);
+
+        const label = document.createElement('label');
+        label.textContent = labelText;
+        label.setAttribute('for', input.id);
+        wrap.appendChild(label);
+
+        return wrap;
+    }
+
+    function tryInit() {
+        const form = document.getElementById('kc-form-login');
+        const username = document.getElementById('username');
+        const otpGroup = document.getElementById('manual-otp-group');
+        const digits = $$('.manual-otp-digit');
+
+        if (!form || !username || !otpGroup || digits.length !== 6) return false;
+        if (form.dataset.eraPatched === '1') return true;
+
+        setupFloating(username, 'Username');
+
+        const otp = document.createElement('input');
+        otp.type = 'text';
+        otp.id = 'era-otp-single';
+        otp.inputMode = 'numeric';
+        otp.maxLength = 6;
+        otp.autocomplete = 'one-time-code';
+        otp.setAttribute('aria-label', 'OTP EraWork, 6 digit');
+        otp.placeholder = ' ';
+
+        const digitsWrapper = otpGroup.querySelector('.otp-digit-wrapper');
+        digitsWrapper.parentNode.insertBefore(otp, digitsWrapper);
+        setupFloating(otp, 'OTP EraWork');
+
+        const syncDigits = () => {
+            const val = otp.value.replace(/\D/g, '').slice(0, 6);
+            otp.value = val;
+            digits.forEach((d, i) => { d.value = val[i] || ''; });
+
+            otp.closest('.era-float')?.classList.remove('era-error');
+            const err = document.getElementById('manual-otp-error');
+            if (err) err.hidden = true;
+        };
+
+        otp.addEventListener('input', syncDigits);
+        otp.addEventListener('paste', (e) => {
+            e.preventDefault();
+            const txt = (e.clipboardData || window.clipboardData).getData('text');
+            otp.value = txt.replace(/\D/g, '').slice(0, 6);
+            syncDigits();
+        });
+
+        username.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                otp.focus();
+            }
+        });
+
+        otp.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                const submitBtn = form.querySelector('#kc-login') || form.querySelector('button[type="submit"]');
+                if (submitBtn) submitBtn.click();
+                else form.requestSubmit();
+            }
+        });
+
+        form.addEventListener('submit', () => {
+            const val = otp.value.replace(/\D/g, '');
+            if (val.length !== 6) {
+                otp.closest('.era-float')?.classList.add('era-error');
+                const err = document.getElementById('manual-otp-error');
+                if (err) err.hidden = false;
+                otp.focus();
+            }
+        }, true);
+
+        form.dataset.eraPatched = '1';
+        return true;
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', tryInit);
+    } else {
+        tryInit();
+    }
+
+    const mo = new MutationObserver(() => {
+        if (tryInit()) mo.disconnect();
+    });
+
+    const startObserver = () => {
+        if (document.body) mo.observe(document.body, { childList: true, subtree: true });
+        else setTimeout(startObserver, 50);
+    };
+    startObserver();
+
+})();
